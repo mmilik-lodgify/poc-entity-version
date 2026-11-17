@@ -16,6 +16,9 @@ var provider = configuration.GetValue<DatabaseProvider>("Database:Provider");
 var settings = configuration.GetSection("Simulation").Get<SimulationSettings>() ?? new SimulationSettings();
 var mode = settings.Mode;
 
+// Every worker stands in for a pod with its own slightly wrong clock.
+var clockSkew = BuildClockSkew(settings);
+
 await using var database = DatabaseContainerFactory.Create(provider);
 
 Console.WriteLine($"MODE    : {mode} - {ModeDescription(mode)}");
@@ -75,16 +78,31 @@ if (mode == SimulationMode.Broken)
     Console.WriteLine("The checks below are EXPECTED to fail in Broken mode - that failure is the point of this run.");
 }
 
-var report = await ValidateAsync();
+var (finalBalance, finalEvents) = await LoadFinalStateAsync();
+var report = Validate(finalBalance, finalEvents);
+
+// 4. The downstream consumer: replay those events out of order and see which ordering field holds up.
+//    Only worth doing on a stream that is internally consistent, which Broken mode's is not.
 Console.WriteLine();
 
 if (mode == SimulationMode.Fixed)
 {
-    Console.WriteLine(report.AllPassed
-        ? "RESULT: SUCCESS - no lost updates, no duplicated versions."
-        : "RESULT: FAILURE - the concurrency token did not hold.");
-    return report.AllPassed ? 0 : 1;
+    var ordering = ConsumerOrderingDemo.Run(finalEvents, finalBalance.Amount, settings);
+    ConsumerOrderingDemo.Print(ordering, settings);
+
+    Console.WriteLine();
+
+    var success = report.AllPassed && ordering.VersionGuardMatches;
+    Console.WriteLine(success
+        ? "RESULT: SUCCESS - no lost updates, no duplicated versions, and a consumer that orders by"
+          + Environment.NewLine
+          + "        Version stays correct under out-of-order delivery."
+        : "RESULT: FAILURE - the concurrency token or the Version ordering did not hold.");
+    return success ? 0 : 1;
 }
+
+ConsumerOrderingDemo.PrintUnorderableStream(finalEvents, finalBalance);
+Console.WriteLine();
 
 // Broken mode inverts the verdict: the run is only useful if the damage actually showed up.
 var lostUpdates = settings.Workers - report.FinalVersion;
@@ -106,6 +124,16 @@ Console.WriteLine(reproduced
 return reproduced ? 0 : 1;
 
 AppDbContext NewContext() => new(dbOptions, mode);
+
+static TimeSpan[] BuildClockSkew(SimulationSettings simulation)
+{
+    // Deterministic, so that a surprising run can be reproduced from the seed printed in the output.
+    var rng = new Random(simulation.Seed);
+
+    return Enumerable.Range(0, simulation.Workers)
+        .Select(_ => TimeSpan.FromMilliseconds((rng.NextDouble() * 2 - 1) * simulation.ClockSkewMs))
+        .ToArray();
+}
 
 static string ModeDescription(SimulationMode m) => m switch
 {
@@ -133,6 +161,10 @@ async Task<int> RunWorkerAsync(int workerId)
                 BalanceId = balance.Id,
                 BalanceSnapshot = new BalanceSnapshot { Id = balance.Id, Amount = balance.Amount },
                 Version = balance.Version,
+
+                // The ordering field today's code would reach for: wall-clock time, read from the clock
+                // of whichever pod handled the request and wrong by up to Simulation:ClockSkewMs.
+                PublishedAtUtc = DateTime.UtcNow + clockSkew[workerId - 1],
             });
 
             // Fixed mode : UPDATE Balances SET Amount = @a, Version = @newV WHERE Id = @id AND Version = @oldV;
@@ -153,7 +185,7 @@ async Task<int> RunWorkerAsync(int workerId)
     throw new InvalidOperationException($"Worker {workerId} gave up after {settings.MaxAttemptsPerWorker} attempts.");
 }
 
-async Task<ValidationReport> ValidateAsync()
+async Task<(Balance Balance, List<BalanceSnapshotEvent> Events)> LoadFinalStateAsync()
 {
     await using var db = NewContext();
 
@@ -163,6 +195,11 @@ async Task<ValidationReport> ValidateAsync()
         .OrderBy(e => e.Version)
         .ToListAsync();
 
+    return (balance, events);
+}
+
+ValidationReport Validate(Balance balance, List<BalanceSnapshotEvent> events)
+{
     var expectedFinalAmount = settings.InitialAmount - settings.Workers * settings.Decrement;
     var allOk = true;
 
@@ -238,4 +275,13 @@ public sealed class SimulationSettings
     public decimal Decrement { get; init; } = 10m;
     public int Workers { get; init; } = 100;
     public int MaxAttemptsPerWorker { get; init; } = 1000;
+
+    /// <summary>How far the simulated pod clocks drift apart, in milliseconds (+/- this value).</summary>
+    public int ClockSkewMs { get; init; } = 250;
+
+    /// <summary>How many positions redelivery may displace a message from its publish order.</summary>
+    public int DeliveryJitter { get; init; } = 5;
+
+    /// <summary>Seed for the clock skew and for the delivery reordering, so a run can be reproduced.</summary>
+    public int Seed { get; init; } = 1234;
 }
