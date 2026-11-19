@@ -24,11 +24,11 @@ public sealed class SimulationSettings
     public int BalanceId { get; init; } = 1;
     public decimal InitialAmount { get; init; } = 1000m;
     public decimal Decrement { get; init; } = 10m;
-    public int Workers { get; init; } = 100;
+    public int Workers { get; init; } = 10;
     public int MaxAttemptsPerWorker { get; init; } = 1000;
 
     /// <summary>How far the simulated pod clocks drift apart, in milliseconds (+/- this value).</summary>
-    public int ClockSkewMs { get; init; } = 250;
+    public int ClockSkewMs { get; init; } = 1000;
 
     /// <summary>How many positions redelivery may displace a message from its publish order.</summary>
     public int DeliveryJitter { get; init; } = 5;
@@ -37,7 +37,7 @@ public sealed class SimulationSettings
     public int Seed { get; init; } = 1234;
 
     /// <summary>How much of the event log to print.</summary>
-    public ShowEvents ShowEvents { get; init; } = ShowEvents.Anomalies;
+    public ShowEvents ShowEvents { get; init; } = ShowEvents.All;
 
     /// <summary>How many leading rows the <see cref="ShowEvents.Anomalies"/> view always shows for context.</summary>
     public int EventContextRows { get; init; } = 5;

@@ -174,8 +174,8 @@ public static class Summary
                 outcome.Run.FinalAmount.ToString("F2"),
                 outcome.Run.FinalVersion.ToString(),
                 outcome.Validation.DuplicateVersionCount.ToString(),
-                Guard(outcome.Ordering, o => o.Timestamp),
-                Guard(outcome.Ordering, o => o.Version),
+                Guard(outcome.Ordering, o => o.Timestamp, luckAware: true),
+                Guard(outcome.Ordering, o => o.Version, luckAware: false),
             ]);
         }
 
@@ -216,7 +216,10 @@ public static class Summary
         return false;
     }
 
-    private static string Guard(ConsumerOrderingDemo.Result? ordering, Func<ConsumerOrderingDemo.Result, ConsumerOrderingDemo.GuardResult> select)
+    private static string Guard(
+        ConsumerOrderingDemo.Result? ordering,
+        Func<ConsumerOrderingDemo.Result, ConsumerOrderingDemo.GuardResult> select,
+        bool luckAware)
     {
         if (ordering is null)
         {
@@ -225,7 +228,15 @@ public static class Summary
 
         var guard = select(ordering);
 
-        return guard.MatchesSourceOfTruth ? "exact" : $"{ordering.SourceVersion - guard.FinalVersion} behind";
+        if (!guard.MatchesSourceOfTruth)
+        {
+            return $"{ordering.SourceVersion - guard.FinalVersion} behind";
+        }
+
+        // A clock guard can land on the right value while the stream still arrived out of order - it only
+        // needs the newest event to happen to carry the latest reading. Say so, or the summary row reads
+        // as though ordering by a timestamp were sound.
+        return luckAware && ordering.TimestampInversions > 0 ? "exact (luck)" : "exact";
     }
 }
 
