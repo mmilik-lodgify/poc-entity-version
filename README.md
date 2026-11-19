@@ -1,145 +1,115 @@
 # EventStorePoc
 
-Many workers change the same entity at the same time. What does it take to not lose any of those changes,
-and to give whatever consumes the resulting events a reliable way to order them?
+Many workers change the same entity at the same time, every change publishes an event, and something
+downstream consumes those events. **What does that consumer need in order to apply them in the right order?**
 
-Three write paths, run side by side in one launch and compared at the end:
+Three scenarios, run side by side in one launch. Every one of them writes correctly — nothing is ever lost in
+any of them — so the only variable left is what the published event gives a consumer to order by:
 
-| Scenario | What it does | |
+| Scenario | The event carries | |
 |---|---|---|
-| `Unguarded` | `Version` is a plain column: `UPDATE ... WHERE Id = @id` | the problem |
-| `Guarded` | `Version` is an EF concurrency token: `UPDATE ... WHERE Id = @id AND Version = @oldV` | the solution |
-| `AtomicIncrement` | one statement increments and returns the new version | the alternative |
+| `TimestampOnly` | `{ Amount, PublishedAtUtc }` | the problem |
+| `Guarded` | `{ Amount, PublishedAtUtc, Version }`, the version from a concurrency token | the solution |
+| `AtomicIncrement` | the same event, the version from a single SQL statement | the alternative |
 
+One variable changes per step: 1→2 adds the version to the event, 2→3 changes how the version is produced.
 Each scenario owns its own table, so one run exercises all three against the same database:
 
 ```
 dotnet run
-dotnet run -- --Simulation:Scenarios Unguarded,Guarded
+dotnet run -- --Simulation:Scenarios TimestampOnly,Guarded
 dotnet run -- --Database:Provider SqlServer
 ```
+
+## The property that matters
+
+A consumer receiving an update has to answer one question: *is this message newer than the state I already
+have?* To answer it, the event needs a field with one property:
+
+> Every write to an entity stamps a **strictly greater, per-entity sequence**, produced by the write itself.
+
+Each part of that is doing work:
+
+- **Strictly greater** makes "newer" decidable, and makes a duplicate impossible to mistake for progress.
+- **Per-entity** is the honest limit. Version 5 of one balance says nothing about version 5 of another, so a
+  consumer has to partition by entity id. This is not a global clock replacement.
+- **Produced by the write** is what ties the value to *commit* order rather than to whoever stamped it. To
+  write version N+1 a worker must first have read a committed version N, so
+  `commit(N) < read(N) < commit(N+1)` — version order **is** commit order.
+
+A publish timestamp fails the first part and the third. Pod clocks drift apart, so the readings are not
+strictly increasing; and the reading is taken by the pod rather than by the database, so nothing ties it to
+the commit at all. `TimestampOnly` exists to prove that rather than assert it.
 
 ## What comes out
 
 ```
-  Scenario         Attempts  Conflicts  Lost  Final amount  Final ver  Dup ver  Consumer by clock  Consumer by version
-  Unguarded              10          0     9         90.00          1        1  unorderable        unorderable
-  Guarded                44         34     0          0.00         10        0  exact (luck)       exact
-  AtomicIncrement        10          0     0          0.00         10        0  6 behind           exact
+  Scenario         Orders by  Attempts  Conflicts  Lost  Final amount  Final ver  Clock inv  Replay by clock  Replay by version
+  TimestampOnly    clock            47         37     0          0.00         10        4/9  4 behind         exact
+  Guarded          version          45         35     0          0.00         10        4/9  exact (luck)     exact
+  AtomicIncrement  version          10          0     0          0.00         10        4/9  3 behind         exact
 
-  Cost of being correct: Guarded needed 44 attempts to land 10 writes, AtomicIncrement needed 10.
+  Cost of being correct: Guarded needed 45 attempts to land 10 writes, AtomicIncrement needed 10.
 ```
 
-Ten workers each take 10 out of a balance holding exactly `10 * 10`, so **a correct run ends on 0** and
-anything left in the account is a write that went missing. Read across one row at a time:
+Ten workers each take 10 out of a balance holding exactly `10 * 10`, so a correct run ends on 0. Read across
+one row at a time:
 
-- **Unguarded** lost 9 of 10 deductions and left 90 of the 100 still sitting there. Nothing threw, nothing
-  retried, nothing was logged. All ten events claim version 1.
-- **Guarded** got every deduction, at the cost of 34 rejected attempts (a similar count on SQL Server).
-- **AtomicIncrement** got every deduction with no rejected attempts at all.
-- **Consumer by clock** vs **by version**: the same event stream replayed into a downstream projection,
-  ordered first by publish timestamp and then by entity version. The version lands on the source of truth
-  every time. The clock does not: it left `AtomicIncrement`'s consumer six updates behind, and the
-  `exact (luck)` on the `Guarded` row is not a pass — that guard finished on the right value although the
+- **`Lost` is 0 in every row, and every balance ends on 0.00 at version 10.** That column is the premise of
+  the whole comparison: no scenario here loses a write, so nothing below is about lost updates.
+- **`Clock inv`** is the finding. In every scenario, 4 of the 9 adjacent pairs in commit order have a
+  *non-increasing* timestamp — the clock disagrees with the order the database committed in. That is a
+  property of the field, so it shows up in all three rows; what differs is who depends on it.
+- **`Replay by clock` vs `Replay by version`**: the same stream, delivered in the same scrambled order, into
+  the same projection twice. The version lands on the source of truth every time. The clock does not.
+- **`exact (luck)`** on the `Guarded` row is not a pass. That guard finished on the right value although the
   stream still arrived out of order, because the newest event happened to carry the latest reading too. On
-  a different run the same code is several updates behind. That is the difference between a field that
-  orders a stream and one that often happens to.
+  the next run it is several updates behind. **This is why the verdict is taken from `Clock inv` and not
+  from the replay** — one replay landing right proves nothing, while a single inversion disproves the field.
 
-Ten workers is the default because all three event logs then fit on one screen and can be read whole, which
-is what makes the write paths comparable row by row. The failure does not need a crowd: ten workers lose
-nine of ten writes on every run. Raise `Simulation:Workers` to see how the cost of each strategy scales — at
-100 workers `Unguarded` loses 94 or 95 of the 100, `Guarded` needs around 1500 attempts on PostgreSQL and
-around 3300 on SQL Server, and `AtomicIncrement` still needs exactly 100. Those counts move a little from
-run to run; the shape does not.
+## The three scenarios
 
-One thing to expect when raising the worker count: the clock column starts saying `exact (luck)` more often,
-which is not the clock getting better. A longer run spreads the commits across a window comparable to the
-skew, so later versions do tend to carry later readings. The ratio that matters in production is the other
-one — writes milliseconds apart, pod clocks seconds or minutes apart — and that is the one the default
-models.
+A bank account (a `Balance`) holds 100. Ten workers each take 10 out, all at the same moment. Every change
+also writes an event, in the same transaction, and something downstream consumes those events.
 
-## The idea in simple words
+### TimestampOnly — the problem
 
-A bank account (a `Balance`) holds 100. 10 workers each take 10 out, all at the same moment, so a run that
-loses nothing empties the account exactly. Every change
-also writes an event, and something downstream consumes those events.
-
-### Unguarded — what goes wrong
-
-A worker reads the balance, subtracts 10, adds 1 to the version and saves:
+The write is protected. `Version` is an EF Core concurrency token, so the save sends:
 
 ```sql
-UPDATE UnguardedBalances SET Amount = @a, Version = @newV WHERE Id = @id
+UPDATE TimestampBalances SET Amount = @a, Version = @newV WHERE Id = @id AND Version = @oldV
 ```
 
-That statement always succeeds. Two workers that read version 7 both write version 8, and the second silently
-erases the first one's deduction.
-
-### Guarded — how we prevent it
-
-`Version` is mapped as an EF Core **concurrency token**, so the same save sends:
-
-```sql
-UPDATE GuardedBalances SET Amount = @a, Version = @newV WHERE Id = @id AND Version = @oldV
-```
-
-1. Every balance has a **Version** number (starts at 0).
-2. A worker reads the balance, subtracts 10, and adds 1 to the version.
-3. The database only accepts the change if the version is still the one the worker originally read.
-4. If someone got there first, 0 rows are updated and EF Core throws `DbUpdateConcurrencyException`.
-5. The worker **starts over**: new read, new calculation, new save, until it succeeds.
-
-### AtomicIncrement — the alternative
-
-Never read-modify-write at all. One statement does the arithmetic in the database and hands back the version
-it just produced, which then goes on the event:
-
-```sql
--- PostgreSQL
-UPDATE "AtomicBalances" SET "Amount" = "Amount" - @d, "Version" = "Version" + 1
-WHERE "Id" = @id RETURNING "Version", "Amount"
-
--- SQL Server
-UPDATE [AtomicBalances] SET [Amount] = [Amount] - @d, [Version] = [Version] + 1
-OUTPUT INSERTED.[Version], INSERTED.[Amount] WHERE [Id] = @id
-```
-
-There is no stale read to lose, so there is nothing to reject and nothing to retry: concurrent callers queue
-on the row lock instead of colliding. It produces exactly the same gapless sequence the token produces, for
-10 attempts instead of 44.
-
-The catch, and the reason the token still matters: the change has to be expressible **relative to the current
-value**. A payload that is replaced wholesale — a rate, a calendar, an availability window — cannot be
-written this way. It also costs a hand-written statement per database provider.
-
-In every scenario the balance update and the event insert happen in **one transaction**, so either both are
-saved or neither is.
-
-## Why a version and not a timestamp
-
-Preventing lost updates is only half the reason the version exists. The other half is downstream.
-
-A consumer receiving an update has to answer one question: *is this message newer than the state I already
-have?* The field usually reached for is a publish timestamp — but that timestamp is read from the clock of
-whichever pod handled the write. Pods drift apart, two writes can land in the same millisecond, and nothing
-ties the value to the order the database committed in.
-
-The version has none of those problems, because of how it is produced: to write version N+1 a worker must
-first have read a committed version N. So `commit(N) < read(N) < commit(N+1)` — **version order is commit
-order**, per entity.
-
-So after the workers finish, each scenario replays its recorded events into a small downstream projection in
-the order a consumer would really see them (each message displaced by a few positions, the way a retry or a
-slow partition reorders a stream) and does it twice: once deciding "is this newer?" by `PublishedAtUtc`, and
-once by `Version`. `AtomicIncrement`'s stream, which is a gapless `1..10`:
+A stale writer updates 0 rows, gets `DbUpdateConcurrencyException` and retries from a fresh read. Nothing is
+lost — the checks say so. The event published afterwards simply does not carry that version:
 
 ```
-    Guard: PublishedAtUtc (pod clock)
-      events applied        : 3
+{ Amount, PublishedAtUtc }
+```
+
+This is a realistic shape rather than a strawman. A service using optimistic concurrency for write safety has
+no obvious ordering field to publish — a SQL Server `rowversion` is a database-wide opaque counter, not
+something to hand a consumer — so it publishes a timestamp instead.
+
+The run then proves the timestamp cannot do the job:
+
+```
+  Ordering field - whether PublishedAtUtc could order this stream at all:
+    [FAIL] PublishedAtUtc increases with commit order (4 of 9 adjacent pairs inverted: v3->v4, v6->v7, v8->v9, v9->v10)
+    [PASS] No two events share a millisecond (0 of 10 events do)
+```
+
+Events are read back in version order, which *is* commit order, so walking them and watching the timestamps
+is a direct test. Four inversions means four places where a consumer ordering by the clock would reject an
+update that was in fact newer. The consequence, replayed:
+
+```
+    Guard: PublishedAtUtc (pod clock)   <- the field this scenario's consumers use
+      events applied        : 4
       stale events applied  : 0   (an update overwritten by an older one)
-      events discarded      : 7
-      final consumer state  : amount 60.00 at version 4
-      verdict               : MISMATCH - the consumer ends up 6 update(s) behind the source of truth
+      events discarded      : 6
+      final consumer state  : amount 40.00 at version 6
+      verdict               : MISMATCH - the consumer ends up 4 update(s) behind the source of truth
 
     Guard: Version (entity version)
       events applied        : 4
@@ -147,151 +117,204 @@ once by `Version`. `AtomicIncrement`'s stream, which is a gapless `1..10`:
       events discarded      : 6
       final consumer state  : amount 0.00 at version 10
       verdict               : MATCH
-
-    Clock skew put 3 of 9 adjacent version pairs in the wrong timestamp order.
-    0 events share a millisecond with another event - no timestamp can order those at all.
 ```
 
-The clock reading is not merely imprecise. It leaves the consumer holding permanently wrong state.
+The balance in the database is correct and the consumer is four updates behind it, permanently. The second
+guard is the same stream ordered by the field this scenario refuses to publish — it is there to show that the
+information existed and was thrown away.
 
-Ten writes are spread far enough apart that none of them share a millisecond. Raise the worker count and
-they start colliding — at 100 workers a dozen or so events share a millisecond with another, and no
-timestamp at that precision can separate those at all. The field is not merely skewed, it is blind.
+### Guarded — the solution
 
-`Unguarded` skips this comparison, because there is nothing left to order: all ten events claim version 1,
-so the stream never reaches the version the entity ended on. (At higher worker counts it hands out a few
-versions, and the highest one in the stream is still not the entity's.) The ordering information was
-destroyed at write time, not in transit. **A version is only a trustworthy ordering field when the write
-path that produced it guaranteed it was unique.**
+Identical write, identical retries, one field more on the event:
+
+```
+{ Amount, PublishedAtUtc, Version }
+```
+
+That is the entire difference between scenario 1 and scenario 2. The mappings are the same line for line,
+which is deliberate: the fix is not a different write, it is publishing what the write already produced.
+
+### Why the version has to come from a guarded write
+
+The tempting wrong fix, once a timestamp has failed, is to add a `Version` column and increment it:
+
+```sql
+UPDATE Balances SET Amount = @a, Version = @newV WHERE Id = @id
+```
+
+That statement always succeeds. Two workers that read version 7 both write version 8, and the second silently
+erases the first one's deduction — so the stream carries two events claiming version 8, a consumer ordering by
+version is no better off than it was with the clock, and the balance is wrong as well. The property is
+*strictly greater, produced by the write*, and a plain column has neither, because nothing made the read and
+the increment atomic. `Guarded` and `AtomicIncrement` are the two ways to actually get it.
+
+### AtomicIncrement — the alternative
+
+The same published event, with the version produced a cheaper way. Never read-modify-write at all: one
+statement does the arithmetic in the database and hands back the version it just produced.
+
+```sql
+-- PostgreSQL
+UPDATE "AtomicBalances" SET "Amount" = "Amount" - @decrement, "Version" = "Version" + 1
+WHERE "Id" = @id
+RETURNING "Version", "Amount"
+
+-- SQL Server
+UPDATE [AtomicBalances] SET [Amount] = [Amount] - @d, [Version] = [Version] + 1
+OUTPUT INSERTED.[Version], INSERTED.[Amount] WHERE [Id] = @id
+```
+
+There is no stale read to lose, so there is nothing to reject and nothing to retry: concurrent callers queue
+on the row lock instead of colliding. It produces the identical gapless sequence for 10 attempts instead of
+45.
+
+The catch, and the reason the token still matters: the change has to be expressible **relative to the current
+value**. A payload that is replaced wholesale — a rate, a calendar, an availability window — cannot be written
+this way. It also costs a hand-written statement per database provider.
+
+In every scenario the balance update and the event insert happen in **one transaction**, so either both are
+visible or neither is.
 
 ## The events raised
 
-Each scenario prints every event it produced, with its parameters. At the default ten workers all three
-lists print whole, so the write paths can be compared row by row.
+Each scenario prints every event it produced, with its parameters. At the default ten workers all three lists
+print whole, so they can be compared row by row.
 
-`Unguarded` — ten writes, one version:
-
-```
-     #  Version  Amount  Published  Worker  Att  Notes
-     1        1   90.00  45:14.393     w10    1  version claimed by 10 events
-     2        1   90.00  45:14.404      w3    1  duplicate version
-     3        1   90.00  45:14.432      w5    1  duplicate version
-     4        1   90.00  45:14.573      w1    1  duplicate version
-     5        1   90.00  45:14.811      w8    1  duplicate version
-     6        1   90.00  45:15.040      w9    1  duplicate version
-     7        1   90.00  45:15.383      w7    1  duplicate version
-     8        1   90.00  45:15.553      w2    1  duplicate version
-     9        1   90.00  45:15.644      w4    1  duplicate version
-    10        1   90.00  45:15.673      w6    1  duplicate version
-```
-
-Ten events, each one reporting a balance of 90 at version 1. Nine of the ten deductions are not in the
-record at all, and no single event looks wrong.
-
-`Guarded` — the same ten writes, each on a version of its own:
+`TimestampOnly`. `Version` is shown here as the ground truth the run uses to judge the timestamp — it is not
+in the published event:
 
 ```
      #  Version  Amount  Published  Worker  Att  Notes
-     1        1   90.00  45:15.755      w2    1
-     2        2   80.00  45:14.765      w1    1  published before previous
-     3        3   70.00  45:15.598      w7    2
-     4        4   60.00  45:15.029      w8    3  published before previous
-     5        5   50.00  45:14.632      w3    4  published before previous
-     6        6   40.00  45:14.675      w5    5
-     7        7   30.00  45:14.623     w10    5  published before previous
-     8        8   20.00  45:15.293      w9    7
-     9        9   10.00  45:15.909      w6    7
-    10       10    0.00  45:15.915      w4    9
+     1        1   90.00  07:12.630     w10    1
+     2        2   80.00  07:12.886      w1    2
+     3        3   70.00  07:13.985      w4    2
+     4        4   60.00  07:12.747      w3    3  published before previous
+     5        5   50.00  07:13.154      w8    4
+     6        6   40.00  07:14.013      w6    5
+     7        7   30.00  07:12.799      w5    6  published before previous
+     8        8   20.00  07:13.916      w2    7
+     9        9   10.00  07:13.745      w7    8  published before previous
+    10       10    0.00  07:13.421      w9    9  published before previous
+```
+
+Read the `Published` column downwards. It goes 12.630, 12.886, 13.985, 12.747, 13.154, 14.013 — the fourth
+event was committed after the third and carries a reading more than a second earlier. A consumer sorting by
+that column does not get this stream back in this order, and no amount of care downstream can recover it.
+
+`Guarded` — same write, same retries, the version now published:
+
+```
+     #  Version  Amount  Published  Worker  Att  Notes
+     1        1   90.00  07:12.916      w5    1
+     2        2   80.00  07:12.870     w10    2  published before previous
+     3        3   70.00  07:13.864      w7    2
+     4        4   60.00  07:13.541      w9    3  published before previous
+     5        5   50.00  07:14.156      w6    4
+     6        6   40.00  07:13.302      w8    5  published before previous
+     7        7   30.00  07:12.903      w3    5  published before previous
+     8        8   20.00  07:13.067      w1    7
+     9        9   10.00  07:14.069      w2    7
+    10       10    0.00  07:14.176      w4    9
 ```
 
 `AtomicIncrement` — the same gapless sequence, every write on its first attempt:
 
 ```
      #  Version  Amount  Published  Worker  Att  Notes
-     1        1   90.00  45:15.120      w8    1
-     2        2   80.00  45:15.985      w6    1
-     3        3   70.00  45:15.883      w2    1  published before previous
-     4        4   60.00  45:15.989      w4    1
-     5        5   50.00  45:14.724     w10    1  published before previous
-     6        6   40.00  45:14.741      w3    1
-     7        7   30.00  45:14.784      w5    1
-     8        8   20.00  45:15.398      w9    1
-     9        9   10.00  45:14.911      w1    1  published before previous
-    10       10    0.00  45:15.733      w7    1
+     1        1   90.00  07:12.996      w5    1
+     2        2   80.00  07:14.224      w6    1
+     3        3   70.00  07:12.968      w3    1  published before previous
+     4        4   60.00  07:12.958     w10    1  published before previous
+     5        5   50.00  07:13.378      w8    1
+     6        6   40.00  07:13.955      w7    1
+     7        7   30.00  07:14.236      w4    1
+     8        8   20.00  07:14.137      w2    1  published before previous
+     9        9   10.00  07:13.146      w1    1  published before previous
+    10       10    0.00  07:13.639      w9    1
 ```
 
 Two columns carry most of the argument:
 
-- `Version` is the ordering field. In `Unguarded` it is the same value ten times, so nothing downstream can
-  order the stream by it — or by anything else. In the other two it is `1..10`, gapless.
-- `Att` is the attempt the write finally landed on, which is where the cost of each strategy shows up:
-  `Guarded` climbs to attempt 9 for ten writes, `AtomicIncrement` stays on attempt 1 throughout.
+- `Version` is `1..10` and gapless in all three, because all three write safely. Only the first scenario
+  declines to publish it.
+- `Att` is the attempt the write finally landed on, which is where the cost of each strategy shows up: the
+  token climbs to attempt 9 for ten writes, `AtomicIncrement` stays on attempt 1 throughout.
 
-`Published` increases in none of the three lists. Pod clocks disagree by up to a second, so a later version
-routinely carries an earlier reading — that is what `published before previous` marks, and with skew it is
-the normal state of affairs rather than an anomaly.
+`published before previous` marks a row whose timestamp is earlier than the previous version's. It appears in
+every scenario, because the clock is skewed in every scenario — that is the point. It is noted on rows that
+print but never causes a row to print, since with pod skew about half the stream qualifies.
 
-Raise the worker count and the full list stops being readable, so `--Simulation:ShowEvents Anomalies` keeps
-a few leading rows for context plus the rows worth looking at and elides the rest. The same scenario at 100
-workers, in eleven lines:
+Raise the worker count and the full list stops being readable, so `--Simulation:ShowEvents Anomalies` keeps a
+few leading rows plus anything worth looking at and elides the rest. At 100 workers:
 
 ```
-  Events raised (100 rows, 6 notable, showing 11)
+  Events raised (100 rows, 0 notable, showing 7)
 
       #  Version  Amount  Published  Worker  Att  Notes
-      1        1  990.00  27:56.903     w10    1  version claimed by 17 events
-      2        1  990.00  27:56.903      w3    1  duplicate version
-      3        1  990.00  27:56.906      w5    1  duplicate version
-      4        1  990.00  27:56.927     w11    1  duplicate version
-      5        1  990.00  27:56.940      w1    1  duplicate version
-    ...                                           12 rows not shown
-     18        2  980.00  27:56.900     w93    1  version claimed by 25 events, published before previous
-    ...                                           24 rows not shown
-     43        3  970.00  27:56.971     w63    1  version claimed by 32 events, published before previous
-    ...                                           31 rows not shown
-     75        4  960.00  27:56.966     w68    1  version claimed by 18 events, published before previous
-    ...                                           17 rows not shown
-     93        5  950.00  27:56.982     w18    1  version claimed by 6 events, published before previous
-    ...                                           5 rows not shown
-     99        6  940.00  27:57.237     w32    1  version claimed by 2 events, published before previous
-    100        6  940.00  27:57.361     w64    1  duplicate version
+      1        1  990.00  08:24.094     w12    1
+      2        2  980.00  08:23.106      w3    1  published before previous
+      3        3  970.00  08:23.222     w99    2
+      4        4  960.00  08:23.160     w96    1  published before previous
+      5        5  950.00  08:23.210      w5    2
+    ...                                           93 rows not shown
+     99       99   10.00  08:24.574     w26   34  published before previous
+    100      100    0.00  08:25.239     w23   33
 ```
 
-A contested version is called out once, on the first event claiming it, with how many events claim it. Gaps
-are flagged. Clock inversions are noted on rows that print, but never cause a row to print — with pod skew,
-half the stream qualifies. `None` prints no event log at all.
+`0 notable` is itself a result: nothing in those 100 events duplicated a version or skipped one. A duplicate
+or a gap would be called out here, which makes this view the thing to watch if a write path ever regresses.
 
 ## What gets checked
 
-The same checks run against every scenario:
+Two groups, kept apart on purpose.
 
-- Final amount is `0` — the balance must end empty, whatever the worker count
-- Final version is `Workers` (10)
-- There are exactly `Workers` events
+**Writes** — every scenario is expected to pass all of these:
+
+- Final amount is `0`; the balance must end empty, whatever the worker count
+- Final version is `Workers`, and there are exactly `Workers` events
 - Event versions are `1..Workers`, with no duplicates and no gaps
 - Each event's amount matches its version (`100 - Version * 10`)
-- A consumer ordering by `Version` reproduces the source of truth under out-of-order delivery
 
-`Guarded` and `AtomicIncrement` must pass all of them. `Unguarded` is *expected* to fail, and the run exits
-non-zero if it does not — if the workers happen not to interleave, raise `Workers` and try again.
+**Ordering field** — whether `PublishedAtUtc` could order the stream at all:
 
-One trap worth noticing in the `Unguarded` output: `Each event snapshot Amount == 100 - Version * 10` still
-passes. Every event is individually consistent with its own duplicated version, so the corrupted stream looks
-perfectly healthy one event at a time. Only comparing events to each other reveals it.
+- Timestamps increase with commit order (they do not, in any scenario)
+- No two events share a millisecond
+
+A scenario that publishes a version passes when its writes are clean *and* a consumer ordering by `Version`
+reproduces the source of truth under out-of-order delivery. `TimestampOnly` passes when its writes are clean
+*and* the timestamps are demonstrably not in commit order. The run exits non-zero if any scenario misses its
+expectation — if `TimestampOnly` ever reports zero inversions, the clocks did not actually disagree on that
+run and `Simulation:ClockSkewMs` wants raising.
+
+### How it scales
+
+Ten workers is the default because all three event logs then fit on one screen. Raise `Simulation:Workers`
+and two things grow:
+
+- **The evidence.** At 100 workers about half of all adjacent pairs are inverted (48 of 99 on one run), and
+  events start sharing a millisecond with each other, which no timestamp at that precision can separate.
+- **The cost of the token.** At 100 workers the guarded scenarios need around 1400 attempts on PostgreSQL to
+  land 100 writes, and between three and four thousand on SQL Server. `AtomicIncrement` needs exactly 100 on
+  both. These counts move from run to run; the shape does not.
+
+What does *not* grow reliably is the replay outcome. Whether a clock-ordered consumer ends up 4 or 18 updates
+behind, or lands on the right value by luck, depends on whether the newest event happened to carry the latest
+reading. That is the whole reason the verdict is the inversion count.
 
 ### What this assumes, and where it stops
 
 - The version increment and the event insert are in the **same transaction**.
-- **Every** write path goes through the protected one. Anything that updates the row without producing a
+- **Every** write path goes through a protected one. Anything that updates the row without producing a
   version breaks the invariant silently.
-- Ordering holds **per entity**. Version 5 of one balance says nothing about version 5 of another, so a
-  consumer must partition by entity id.
+- Ordering holds **per entity**. A consumer must partition by entity id.
+- A version orders one entity's stream. It is not a global sequence and will not order a cross-entity feed or
+  drive a watermark poll across a whole table.
 
-There is deliberately **no unique index** on `(Scenario, BalanceId, Version)`: the guarded scenarios have to
-prove their write path alone is enough, and `Unguarded` has to be free to write the duplicates it produces so
-they can be counted. In production you would add that index — it is the only thing that catches a write path
-which bypasses the tracked entity (`ExecuteUpdate`, raw SQL, bulk backfills), where a concurrency token does
-not apply at all.
+There is deliberately **no unique index** on `(Scenario, BalanceId, Version)`: every scenario has to prove its
+write path alone produces unique versions, and an index that rejected a duplicate would be doing that work
+instead of the thing under test. In production you would add it — it is the only thing that catches a write
+path which bypasses the tracked entity (`ExecuteUpdate`, raw SQL, bulk backfills), where a concurrency token
+does not apply at all.
 
 ## How to run
 
@@ -320,11 +343,11 @@ Settings live in `appsettings.json` and can be overridden on the command line:
 | File | What it does |
 |---|---|
 | `Program.cs` | Starts the database, runs each selected scenario, prints the summary |
-| `Scenarios.cs` | The three scenario definitions and the `--Simulation:Scenarios` parsing |
-| `ScenarioRunner.cs` | Releases the workers; holds all three write paths |
+| `Scenarios.cs` | The three scenario definitions, the ordering field each publishes, and `--Simulation:Scenarios` parsing |
+| `ScenarioRunner.cs` | Releases the workers; holds the two write paths the three scenarios share |
 | `Domain.cs` | The three balance types, `BalanceSnapshot`, `BalanceSnapshotEvent` |
-| `AppDbContext.cs` | EF Core mapping; the three mappings side by side |
-| `Validation.cs` | The checks, applied identically to every scenario |
+| `AppDbContext.cs` | EF Core mapping; the first two are identical on purpose |
+| `Validation.cs` | The write checks and the ordering-field checks |
 | `ConsumerOrderingDemo.cs` | Replays events out of order, comparing the timestamp and version guards |
 | `Reporting.cs` | The annotated event log and the summary table |
 | `SimulationSettings.cs` | Everything configurable |

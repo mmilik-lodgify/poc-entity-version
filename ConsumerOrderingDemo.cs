@@ -5,13 +5,17 @@ namespace EventStorePoc;
 /// out of order, because of retries, partitions and redelivery.
 ///
 /// A consumer that must not apply a stale update needs one question answered: "is the message I just got
-/// newer than the state I already have?" This compares the two fields usually available to answer it:
+/// newer than the state I already have?" Both candidate fields are replayed here, for every scenario:
 ///
 ///   * <see cref="BalanceSnapshotEvent.PublishedAtUtc"/> - wall-clock time read from the producing pod.
-///   * <see cref="BalanceSnapshotEvent.Version"/>        - the entity version produced by the write path.
+///   * <see cref="BalanceSnapshotEvent.Version"/>        - the per-entity sequence the write produced.
+///
+/// Replaying both every time is what keeps the comparison fair: same stream, same delivery order, and the
+/// only thing that changes is which field decides. Which of the two a given scenario's consumers are
+/// actually allowed to use is <see cref="ScenarioDefinition.ConsumerOrdersBy"/>.
 ///
 /// The projection is trivially simple on purpose: keep the amount of the newest event seen so far. With a
-/// correct ordering field the result equals the source of truth no matter how the events arrive.
+/// sound ordering field the result equals the source of truth no matter how the events arrive.
 /// </summary>
 public static class ConsumerOrderingDemo
 {
@@ -19,6 +23,7 @@ public static class ConsumerOrderingDemo
 
     public sealed record GuardResult(
         string Name,
+        OrderingField Field,
         decimal FinalAmount,
         int FinalVersion,
         int Applied,
@@ -32,19 +37,10 @@ public static class ConsumerOrderingDemo
         decimal SourceOfTruth,
         int SourceVersion,
         int DeliveryOutOfOrderPairs,
-        int TimestampInversions,
-        int AdjacentPairs,
-        int SameMillisecondEvents)
+        int AdjacentPairs)
     {
         public bool VersionGuardMatches => Version.MatchesSourceOfTruth;
     }
-
-    /// <summary>
-    /// Whether comparing ordering fields on this stream means anything. A stream containing two events that
-    /// claim the same version cannot be ordered by any field, so there is nothing to compare.
-    /// </summary>
-    public static bool IsOrderable(IReadOnlyList<BalanceSnapshotEvent> events) =>
-        events.Count > 0 && events.GroupBy(e => e.Version).All(g => g.Count() == 1);
 
     public static Result Run(IReadOnlyList<BalanceSnapshotEvent> events, decimal sourceOfTruth, SimulationSettings settings)
     {
@@ -57,28 +53,17 @@ public static class ConsumerOrderingDemo
 
         var byTimestamp = Replay(
             "PublishedAtUtc (pod clock)",
+            OrderingField.PublishedAtUtc,
             delivery,
             sourceOfTruth,
             isNewer: (candidate, lastApplied) => candidate.PublishedAtUtc > lastApplied.PublishedAtUtc);
 
         var byVersion = Replay(
             "Version (entity version)",
+            OrderingField.Version,
             delivery,
             sourceOfTruth,
             isNewer: (candidate, lastApplied) => candidate.Version > lastApplied.Version);
-
-        // How often the clock disagrees with the real order: walk the events in version order and count the
-        // neighbours whose timestamps do not increase.
-        var inVersionOrder = events.OrderBy(e => e.Version).ToList();
-        var inversions = inVersionOrder
-            .Zip(inVersionOrder.Skip(1))
-            .Count(pair => pair.Second.PublishedAtUtc <= pair.First.PublishedAtUtc);
-
-        // Events a millisecond-precision timestamp cannot separate at all, however accurate the clocks are.
-        var sameMillisecond = events
-            .GroupBy(e => new DateTime(e.PublishedAtUtc.Ticks - e.PublishedAtUtc.Ticks % TimeSpan.TicksPerMillisecond))
-            .Where(g => g.Count() > 1)
-            .Sum(g => g.Count());
 
         return new Result(
             Timestamp: byTimestamp,
@@ -86,37 +71,14 @@ public static class ConsumerOrderingDemo
             SourceOfTruth: sourceOfTruth,
             SourceVersion: events.Count == 0 ? 0 : events.Max(e => e.Version),
             DeliveryOutOfOrderPairs: deliveryOutOfOrder,
-            TimestampInversions: inversions,
-            AdjacentPairs: Math.Max(inVersionOrder.Count - 1, 0),
-            SameMillisecondEvents: sameMillisecond);
+            AdjacentPairs: Math.Max(events.Count - 1, 0));
     }
 
-    /// <summary>
-    /// Said instead of a guard comparison when the stream cannot be ordered by anything: several events carry
-    /// the same version, and the highest version in the stream is not necessarily the one the entity ended on.
-    /// </summary>
-    public static void PrintUnorderableStream(IReadOnlyList<BalanceSnapshotEvent> events, int finalVersion)
-    {
-        var sharingAVersion = events
-            .GroupBy(e => e.Version)
-            .Where(g => g.Count() > 1)
-            .Sum(g => g.Count());
-        var highestInStream = events.Count == 0 ? 0 : events.Max(e => e.Version);
-
-        Console.WriteLine($"{Indent}Downstream consumer: which ordering field survives out-of-order delivery?");
-        Console.WriteLine($"{Indent}  Not run for this scenario: there is nothing left to order.");
-        Console.WriteLine();
-        Console.WriteLine($"{Indent}  {sharingAVersion} of {events.Count} events carry a version that another event also carries.");
-        Console.WriteLine(highestInStream == finalVersion
-            ? $"{Indent}  {events.Count} writes produced a stream that only reaches version {highestInStream}."
-            : $"{Indent}  The highest version in the stream is {highestInStream}, but the entity ended on version {finalVersion}.");
-        Console.WriteLine();
-        Console.WriteLine($"{Indent}  No consumer can recover the right order from that, whichever field it sorts by - the");
-        Console.WriteLine($"{Indent}  ordering information was destroyed at write time, not in transit. Fix the write path first.");
-        Console.WriteLine();
-    }
-
-    public static void Print(Result result, SimulationSettings settings)
+    public static void Print(
+        Result result,
+        ScenarioDefinition scenario,
+        ValidationReport validation,
+        SimulationSettings settings)
     {
         Console.WriteLine($"{Indent}Downstream consumer: which ordering field survives out-of-order delivery?");
         Console.WriteLine($"{Indent}  Clocks differ by up to +/-{settings.ClockSkewMs} ms; messages arrive displaced by up to "
@@ -125,30 +87,28 @@ public static class ConsumerOrderingDemo
         Console.WriteLine($"{Indent}  Source of truth: Amount = {result.SourceOfTruth} at version {result.SourceVersion}");
         Console.WriteLine();
 
-        PrintGuard(result.Timestamp, result.SourceVersion);
-        PrintGuard(result.Version, result.SourceVersion);
+        PrintGuard(result.Timestamp, result.SourceVersion, scenario);
+        PrintGuard(result.Version, result.SourceVersion, scenario);
 
-        Console.WriteLine($"{Indent}  Clock skew put {result.TimestampInversions} of {result.AdjacentPairs} adjacent version pairs in the wrong timestamp order.");
-        Console.WriteLine($"{Indent}  {result.SameMillisecondEvents} events share a millisecond with another event - no timestamp can order those at all.");
-
-        if (result.Timestamp.MatchesSourceOfTruth)
+        if (result.Timestamp.MatchesSourceOfTruth && validation.ClockInversions > 0)
         {
+            Console.WriteLine($"{Indent}  Note: the timestamp guard happened to land on the right final value this run, because the");
+            Console.WriteLine($"{Indent}  event with the latest clock reading also happened to be the newest one. That is luck, not");
+            Console.WriteLine($"{Indent}  correctness - {validation.ClockInversions} pairs still arrived in the wrong order, and the next run can land");
+            Console.WriteLine($"{Indent}  anywhere. It is exactly why this scenario is judged on those inversions rather than on");
+            Console.WriteLine($"{Indent}  whether one replay came out right.");
             Console.WriteLine();
-            Console.WriteLine($"{Indent}  Note: the timestamp guard happened to land on the right final value this run - the event");
-            Console.WriteLine($"{Indent}  with the latest clock reading also happened to be the newest one. That is luck, not");
-            Console.WriteLine($"{Indent}  correctness: {result.TimestampInversions} pairs still arrived in the wrong order. Raise Simulation:ClockSkewMs.");
         }
-
-        Console.WriteLine();
     }
 
-    private static void PrintGuard(GuardResult guard, int sourceVersion)
+    private static void PrintGuard(GuardResult guard, int sourceVersion, ScenarioDefinition scenario)
     {
         var verdict = guard.MatchesSourceOfTruth
             ? "MATCH"
             : $"MISMATCH - the consumer ends up {sourceVersion - guard.FinalVersion} update(s) behind the source of truth";
+        var dependency = guard.Field == scenario.ConsumerOrdersBy ? "   <- the field this scenario's consumers use" : "";
 
-        Console.WriteLine($"{Indent}  Guard: {guard.Name}");
+        Console.WriteLine($"{Indent}  Guard: {guard.Name}{dependency}");
         Console.WriteLine($"{Indent}    events applied        : {guard.Applied}");
         Console.WriteLine($"{Indent}    stale events applied  : {guard.StaleApplied}   (an update overwritten by an older one)");
         Console.WriteLine($"{Indent}    events discarded      : {guard.Discarded}");
@@ -159,6 +119,7 @@ public static class ConsumerOrderingDemo
 
     private static GuardResult Replay(
         string name,
+        OrderingField field,
         IReadOnlyList<BalanceSnapshotEvent> delivery,
         decimal sourceOfTruth,
         Func<BalanceSnapshotEvent, BalanceSnapshotEvent, bool> isNewer)
@@ -192,6 +153,7 @@ public static class ConsumerOrderingDemo
 
         return new GuardResult(
             Name: name,
+            Field: field,
             FinalAmount: projectedAmount,
             FinalVersion: lastApplied?.Version ?? 0,
             Applied: applied,

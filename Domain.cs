@@ -1,8 +1,10 @@
 namespace EventStorePoc;
 
 /// <summary>
-/// The balance types below are deliberately identical in shape. The only thing that differs between them is
-/// how the write is protected, configured per type in <see cref="AppDbContext.OnModelCreating"/>.
+/// The balance types below are deliberately identical in shape, and two of the three are mapped identically
+/// as well (see <see cref="AppDbContext.OnModelCreating"/>). That is the point: every write path here is
+/// correct, so the write is not the variable under test. What differs is what the resulting event publishes
+/// for a consumer to order the stream by.
 ///
 /// Keeping them as three separate entity types - rather than one type remapped at startup - is what lets
 /// every scenario run in a single launch, against the same database, and be compared side by side at the end.
@@ -15,10 +17,14 @@ public interface IBalance
 }
 
 /// <summary>
-/// The problem. Version is an ordinary column, so EF emits
-/// <c>UPDATE ... WHERE Id = @id</c> and two workers that read the same version both write it back.
+/// The problem - and note that it is not a write problem. This row is guarded exactly like
+/// <see cref="GuardedBalance"/>, token and retry loop included, so it never loses an update. What its
+/// scenario does differently is downstream: the event it publishes carries only the pod's wall-clock time,
+/// leaving a consumer nothing else to order the stream by. The realistic shape of this is a service that
+/// uses optimistic concurrency for write safety and then publishes a timestamp, because a SQL Server
+/// <c>rowversion</c> is not something you would hand to a consumer as an ordering field.
 /// </summary>
-public class UnguardedBalance : IBalance
+public class TimestampBalance : IBalance
 {
     public int Id { get; set; }
     public decimal Amount { get; set; }
@@ -26,8 +32,9 @@ public class UnguardedBalance : IBalance
 }
 
 /// <summary>
-/// The solution. Version is an EF concurrency token, so EF emits
-/// <c>UPDATE ... WHERE Id = @id AND Version = @oldV</c>, a stale writer updates 0 rows and is retried.
+/// The solution. The same guarded write, publishing the version it produced. Version is an EF concurrency
+/// token, so EF emits <c>UPDATE ... WHERE Id = @id AND Version = @oldV</c>, a stale writer updates 0 rows
+/// and is retried - which is what makes the published version unique, and therefore worth ordering by.
 /// </summary>
 public class GuardedBalance : IBalance
 {
@@ -60,15 +67,22 @@ public class BalanceSnapshotEvent
     public Guid Id { get; set; }
 
     /// <summary>
-    /// Which scenario produced this event. All scenarios share one event table on purpose: the event is
-    /// identical in each of them, and only the protection on the balance row differs.
+    /// Which scenario produced this event. All scenarios share one event table on purpose: the stored row is
+    /// the same shape in each of them, and what differs is which of its fields the scenario's consumers are
+    /// given to order by.
     /// </summary>
     public required string Scenario { get; set; }
 
     public int BalanceId { get; set; }
     public required BalanceSnapshot BalanceSnapshot { get; set; }
 
-    /// <summary>Same value as the balance's Version after the change that produced this event.</summary>
+    /// <summary>
+    /// The version the write produced: the entity's own commit sequence, and the field a consumer can trust.
+    /// The TimestampOnly scenario models a service that does not publish it - the value is still recorded
+    /// here, because it is the ground truth the run needs in order to prove what the timestamp gets wrong,
+    /// but nothing downstream in that scenario is allowed to read it.
+    /// See <see cref="ScenarioDefinition.ConsumerOrdersBy"/>.
+    /// </summary>
     public int Version { get; set; }
 
     /// <summary>

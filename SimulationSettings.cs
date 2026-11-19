@@ -17,7 +17,7 @@ public sealed class SimulationSettings
 {
     /// <summary>
     /// Which scenarios to run, comma separated and in the order given, or "all".
-    /// e.g. <c>--Simulation:Scenarios Unguarded,Guarded</c>
+    /// e.g. <c>--Simulation:Scenarios TimestampOnly,Guarded</c>
     /// </summary>
     public string Scenarios { get; init; } = "all";
 

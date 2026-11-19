@@ -83,7 +83,7 @@ public static class ScenarioRunner
 
                 await (scenario.Kind switch
                 {
-                    ScenarioKind.Unguarded => WriteThroughEfAsync<UnguardedBalance>(db, scenario, settings, skew, workerId, attempt),
+                    ScenarioKind.TimestampOnly => WriteThroughEfAsync<TimestampBalance>(db, scenario, settings, skew, workerId, attempt),
                     ScenarioKind.Guarded => WriteThroughEfAsync<GuardedBalance>(db, scenario, settings, skew, workerId, attempt),
                     ScenarioKind.AtomicIncrement => WriteAtomicallyAsync(db, scenario, settings, skew, workerId, attempt),
                     _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario.Kind, "Unsupported scenario"),
@@ -103,8 +103,10 @@ public static class ScenarioRunner
     }
 
     /// <summary>
-    /// Read, change in memory, write back. Whether that is safe depends entirely on how TBalance maps its
-    /// Version property, which is the only difference between the Unguarded and Guarded scenarios.
+    /// Read, change in memory, write back, under the concurrency token TBalance maps on its Version. Both
+    /// scenarios that come through here - TimestampOnly and Guarded - are protected identically and lose
+    /// nothing. They differ only in which field the event they publish gives a consumer to order by, so this
+    /// method is deliberately unaware of which one it is serving.
     /// </summary>
     private static async Task WriteThroughEfAsync<TBalance>(
         AppDbContext db,
@@ -231,8 +233,8 @@ public static class ScenarioRunner
 
         switch (scenario.Kind)
         {
-            case ScenarioKind.Unguarded:
-                db.UnguardedBalances.Add(new UnguardedBalance
+            case ScenarioKind.TimestampOnly:
+                db.TimestampBalances.Add(new TimestampBalance
                 {
                     Id = settings.BalanceId, Amount = settings.InitialAmount, Version = 0,
                 });
@@ -268,7 +270,7 @@ public static class ScenarioRunner
 
         IBalance balance = scenario.Kind switch
         {
-            ScenarioKind.Unguarded => await db.UnguardedBalances.AsNoTracking().SingleAsync(b => b.Id == settings.BalanceId),
+            ScenarioKind.TimestampOnly => await db.TimestampBalances.AsNoTracking().SingleAsync(b => b.Id == settings.BalanceId),
             ScenarioKind.Guarded => await db.GuardedBalances.AsNoTracking().SingleAsync(b => b.Id == settings.BalanceId),
             ScenarioKind.AtomicIncrement => await db.AtomicBalances.AsNoTracking().SingleAsync(b => b.Id == settings.BalanceId),
             _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario.Kind, "Unsupported scenario"),

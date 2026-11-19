@@ -69,6 +69,7 @@ async Task<ScenarioOutcome> RunScenarioAsync(ScenarioDefinition scenario)
     Console.WriteLine($"  {scenario.Statement}");
     Console.WriteLine(new string('=', 100));
     Console.WriteLine($"  {scenario.Summary}");
+    Console.WriteLine($"  Consumers order by: {scenario.ConsumerOrdersBy}");
     Console.WriteLine();
 
     var run = await ScenarioRunner.RunAsync(scenario, dbOptions, settings, clockSkew);
@@ -91,24 +92,16 @@ async Task<ScenarioOutcome> RunScenarioAsync(ScenarioDefinition scenario)
 
     EventLog.Print(run, settings);
 
-    // The guard comparison is only worth running on a stream that is internally consistent. Decide that from
-    // the events themselves rather than from which scenario produced them.
-    var ordering = ConsumerOrderingDemo.IsOrderable(run.Events)
-        ? ConsumerOrderingDemo.Run(run.Events, run.FinalAmount, settings)
-        : null;
+    var ordering = ConsumerOrderingDemo.Run(run.Events, run.FinalAmount, settings);
+    ConsumerOrderingDemo.Print(ordering, scenario, validation, settings);
 
-    if (ordering is null)
-    {
-        ConsumerOrderingDemo.PrintUnorderableStream(run.Events, run.FinalVersion);
-    }
-    else
-    {
-        ConsumerOrderingDemo.Print(ordering, settings);
-    }
-
-    var metExpectation = scenario.ExpectsLostUpdates
-        ? !validation.AllPassed
-        : validation.AllPassed && ordering?.VersionGuardMatches == true;
+    // A scenario whose consumers depend on the clock is judged on whether the clock can be shown NOT to be
+    // commit order. That is a proof: it holds however this particular replay happened to come out, which
+    // matters because a skewed clock can still land on the right final value by chance. The scenarios that
+    // publish a version are judged on the replay itself, where for a sound field there is no chance involved.
+    var metExpectation = scenario.ExpectsUnsoundOrdering
+        ? validation.WritesPassed && !validation.ClockIsCommitOrder
+        : validation.WritesPassed && ordering.VersionGuardMatches;
 
     return new ScenarioOutcome(run, validation, ordering, metExpectation);
 }
@@ -116,7 +109,6 @@ async Task<ScenarioOutcome> RunScenarioAsync(ScenarioDefinition scenario)
 // Zero conflicts means something quite different in each scenario, and the difference is the whole point.
 static string ConflictNote(ScenarioDefinition scenario, ScenarioRun run) => (scenario.Kind, run.Conflicts) switch
 {
-    (ScenarioKind.Unguarded, 0) => "   <- nothing rejected any writer",
     (ScenarioKind.AtomicIncrement, 0) => "   <- nothing to reject: there is no stale read to lose",
     _ => "",
 };

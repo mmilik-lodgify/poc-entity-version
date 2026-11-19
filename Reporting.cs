@@ -3,7 +3,7 @@ namespace EventStorePoc;
 public sealed record ScenarioOutcome(
     ScenarioRun Run,
     ValidationReport Validation,
-    ConsumerOrderingDemo.Result? Ordering,
+    ConsumerOrderingDemo.Result Ordering,
     bool MetExpectation);
 
 /// <summary>
@@ -159,8 +159,8 @@ public static class Summary
         {
             new[]
             {
-                "Scenario", "Attempts", "Conflicts", "Lost", "Final amount", "Final ver", "Dup ver",
-                "Consumer by clock", "Consumer by version",
+                "Scenario", "Orders by", "Attempts", "Conflicts", "Lost", "Final amount", "Final ver",
+                "Clock inv", "Replay by clock", "Replay by version",
             },
         };
 
@@ -168,24 +168,26 @@ public static class Summary
         {
             table.Add([
                 outcome.Run.Scenario.Name,
+                outcome.Run.Scenario.ConsumerOrdersBy == OrderingField.Version ? "version" : "clock",
                 outcome.Run.TotalAttempts.ToString(),
                 outcome.Run.Conflicts.ToString(),
                 outcome.Validation.LostUpdates.ToString(),
                 outcome.Run.FinalAmount.ToString("F2"),
                 outcome.Run.FinalVersion.ToString(),
-                outcome.Validation.DuplicateVersionCount.ToString(),
-                Guard(outcome.Ordering, o => o.Timestamp, luckAware: true),
-                Guard(outcome.Ordering, o => o.Version, luckAware: false),
+                $"{outcome.Validation.ClockInversions}/{outcome.Validation.AdjacentPairs}",
+                Guard(outcome, o => o.Timestamp, luckAware: true),
+                Guard(outcome, o => o.Version, luckAware: false),
             ]);
         }
 
-        Table.Write(table, [false, true, true, true, true, true, true, false, false], indent: "  ");
+        Table.Write(table, [false, false, true, true, true, true, true, true, false, false], indent: "  ");
         Console.WriteLine();
 
-        // Only worth comparing the cost of the scenarios that actually got the right answer.
-        var correct = outcomes.Where(o => !o.Run.Scenario.ExpectsLostUpdates).ToList();
-        var cheapest = correct.MinBy(o => o.Run.TotalAttempts);
-        var dearest = correct.MaxBy(o => o.Run.TotalAttempts);
+        // Every scenario here writes correctly, so the interesting cost comparison is between the two that
+        // produce a publishable version - the ordering-only scenario shares its write path with Guarded.
+        var publishesVersion = outcomes.Where(o => o.Run.Scenario.ConsumerOrdersBy == OrderingField.Version).ToList();
+        var cheapest = publishesVersion.MinBy(o => o.Run.TotalAttempts);
+        var dearest = publishesVersion.MaxBy(o => o.Run.TotalAttempts);
 
         if (cheapest is not null && dearest is not null && cheapest != dearest)
         {
@@ -207,9 +209,9 @@ public static class Summary
 
         foreach (var outcome in missed)
         {
-            Console.WriteLine(outcome.Run.Scenario.ExpectsLostUpdates
-                ? $"    {outcome.Run.Scenario.Name}: expected lost updates, found none. The workers happened not to "
-                  + "interleave - raise Simulation:Workers and run it again."
+            Console.WriteLine(outcome.Run.Scenario.ExpectsUnsoundOrdering
+                ? $"    {outcome.Run.Scenario.Name}: the pod clocks were expected to disagree with commit order "
+                  + "somewhere, and this run they agreed throughout. Raise Simulation:ClockSkewMs."
                 : $"    {outcome.Run.Scenario.Name}: expected a clean run, got one or more failed checks.");
         }
 
@@ -217,26 +219,21 @@ public static class Summary
     }
 
     private static string Guard(
-        ConsumerOrderingDemo.Result? ordering,
+        ScenarioOutcome outcome,
         Func<ConsumerOrderingDemo.Result, ConsumerOrderingDemo.GuardResult> select,
         bool luckAware)
     {
-        if (ordering is null)
-        {
-            return "unorderable";
-        }
-
-        var guard = select(ordering);
+        var guard = select(outcome.Ordering);
 
         if (!guard.MatchesSourceOfTruth)
         {
-            return $"{ordering.SourceVersion - guard.FinalVersion} behind";
+            return $"{outcome.Ordering.SourceVersion - guard.FinalVersion} behind";
         }
 
         // A clock guard can land on the right value while the stream still arrived out of order - it only
         // needs the newest event to happen to carry the latest reading. Say so, or the summary row reads
         // as though ordering by a timestamp were sound.
-        return luckAware && ordering.TimestampInversions > 0 ? "exact (luck)" : "exact";
+        return luckAware && outcome.Validation.ClockInversions > 0 ? "exact (luck)" : "exact";
     }
 }
 
