@@ -1,52 +1,100 @@
 # EventStorePoc
 
-A small proof of concept, in two halves:
+Many workers change the same entity at the same time. What does it take to not lose any of those changes,
+and to give whatever consumes the resulting events a reliable way to order them?
 
-1. **The problem** — many workers change the same entity at the same time, and the updates are lost.
-2. **The solution** — an entity version, maintained as a concurrency token, which stops the loss *and*
-   gives downstream consumers something they can order by.
+Three write paths, run side by side in one launch and compared at the end:
 
-Pick the half with `Simulation:Mode`:
+| Scenario | What it does | |
+|---|---|---|
+| `Unguarded` | `Version` is a plain column: `UPDATE ... WHERE Id = @id` | the problem |
+| `Guarded` | `Version` is an EF concurrency token: `UPDATE ... WHERE Id = @id AND Version = @oldV` | the solution |
+| `AtomicIncrement` | one statement increments and returns the new version | the alternative |
+
+Each scenario owns its own table, so one run exercises all three against the same database:
 
 ```
-dotnet run -- --Simulation:Mode Broken
-dotnet run -- --Simulation:Mode Fixed
+dotnet run
+dotnet run -- --Simulation:Scenarios Unguarded,Guarded
+dotnet run -- --Database:Provider SqlServer
 ```
+
+## What comes out
+
+```
+  Scenario         Attempts  Conflicts  Lost  Final amount  Final ver  Dup ver  Consumer by clock  Consumer by version
+  Unguarded             100          0    95        950.00          5        6  unorderable        unorderable
+  Guarded              1504       1404     0          0.00        100        0  6 behind           exact
+  AtomicIncrement       100          0     0          0.00        100        0  14 behind          exact
+
+  Cost of being correct: Guarded needed 1504 attempts to land 100 writes, AtomicIncrement needed 100.
+```
+
+Read across one row at a time:
+
+- **Unguarded** lost 95 of 100 deductions and left the balance at 950 instead of 0. Nothing threw, nothing
+  retried, nothing was logged. Six versions were handed out to a hundred events.
+- **Guarded** got every deduction, at the cost of 1404 rejected attempts (3266 on SQL Server).
+- **AtomicIncrement** got every deduction with no rejected attempts at all.
+- **Consumer by clock** vs **by version**: the same event stream replayed into a downstream projection,
+  ordered first by publish timestamp and then by entity version. The clock leaves the consumer several
+  updates behind. The version lands exactly on the source of truth.
 
 ## The idea in simple words
 
-Imagine a bank account (a `Balance`) with 1000 in it. 100 workers each want to take 10 out, all at the
-same moment. Every change also publishes an event, and something downstream consumes those events.
+A bank account (a `Balance`) holds 1000. 100 workers each take 10 out, all at the same moment. Every change
+also writes an event, and something downstream consumes those events.
 
-### Broken mode: what goes wrong
+### Unguarded — what goes wrong
 
-`Balance.Version` is an ordinary column. A worker reads the balance, subtracts 10, adds 1 to the version
-and saves, which sends:
-
-```sql
-UPDATE Balances SET Amount = @a, Version = @newV WHERE Id = @id
-```
-
-That statement always succeeds. Two workers that read version 7 both write version 8, and the second one
-silently erases the first one's deduction. Nothing throws, nothing retries, nothing is logged.
-
-### Fixed mode: how we prevent it
-
-`Balance.Version` is mapped as an EF Core **concurrency token**, so the same save sends:
+A worker reads the balance, subtracts 10, adds 1 to the version and saves:
 
 ```sql
-UPDATE Balances SET Amount = @a, Version = @newV WHERE Id = @id AND Version = @oldV
+UPDATE UnguardedBalances SET Amount = @a, Version = @newV WHERE Id = @id
 ```
 
-1. Every `Balance` has a **Version** number (starts at 0).
+That statement always succeeds. Two workers that read version 7 both write version 8, and the second silently
+erases the first one's deduction.
+
+### Guarded — how we prevent it
+
+`Version` is mapped as an EF Core **concurrency token**, so the same save sends:
+
+```sql
+UPDATE GuardedBalances SET Amount = @a, Version = @newV WHERE Id = @id AND Version = @oldV
+```
+
+1. Every balance has a **Version** number (starts at 0).
 2. A worker reads the balance, subtracts 10, and adds 1 to the version.
 3. The database only accepts the change if the version is still the one the worker originally read.
-4. If someone else got there first, 0 rows are updated and EF Core throws `DbUpdateConcurrencyException`.
-5. The worker simply **starts over**: new read, new calculation, new save, until it succeeds.
+4. If someone got there first, 0 rows are updated and EF Core throws `DbUpdateConcurrencyException`.
+5. The worker **starts over**: new read, new calculation, new save, until it succeeds.
 
-Each successful save also writes an **event** (`BalanceSnapshotEvent`): a snapshot of the balance (id and
-amount), the version number, and the publish time. The balance update and the event insert happen in
-**one transaction**, so either both are saved or neither is.
+### AtomicIncrement — the alternative
+
+Never read-modify-write at all. One statement does the arithmetic in the database and hands back the version
+it just produced, which then goes on the event:
+
+```sql
+-- PostgreSQL
+UPDATE "AtomicBalances" SET "Amount" = "Amount" - @d, "Version" = "Version" + 1
+WHERE "Id" = @id RETURNING "Version", "Amount"
+
+-- SQL Server
+UPDATE [AtomicBalances] SET [Amount] = [Amount] - @d, [Version] = [Version] + 1
+OUTPUT INSERTED.[Version], INSERTED.[Amount] WHERE [Id] = @id
+```
+
+There is no stale read to lose, so there is nothing to reject and nothing to retry: concurrent callers queue
+on the row lock instead of colliding. It produces exactly the same gapless sequence the token produces, for
+100 attempts instead of 1504.
+
+The catch, and the reason the token still matters: the change has to be expressible **relative to the current
+value**. A payload that is replaced wholesale — a rate, a calendar, an availability window — cannot be
+written this way. It also costs a hand-written statement per database provider.
+
+In every scenario the balance update and the event insert happen in **one transaction**, so either both are
+saved or neither is.
 
 ## Why a version and not a timestamp
 
@@ -61,46 +109,77 @@ The version has none of those problems, because of how it is produced: to write 
 first have read a committed version N. So `commit(N) < read(N) < commit(N+1)` — **version order is commit
 order**, per entity.
 
-So after the workers finish, Fixed mode replays the recorded events into a small downstream projection in
+So after the workers finish, each scenario replays its recorded events into a small downstream projection in
 the order a consumer would really see them (each message displaced by a few positions, the way a retry or a
 slow partition reorders a stream) and does it twice: once deciding "is this newer?" by `PublishedAtUtc`, and
-once by `Version`. A measured run:
+once by `Version`:
 
 ```
-  Guard: PublishedAtUtc (pod clock)
-    events applied        : 22
-    stale events applied  : 4   (an update overwritten by an older one)
-    events discarded      : 78
-    final consumer state  : amount 100.00 at version 90
-    verdict               : MISMATCH - the consumer ends up 10 update(s) behind the source of truth
+    Guard: PublishedAtUtc (pod clock)
+      events applied        : 23
+      stale events applied  : 4   (an update overwritten by an older one)
+      events discarded      : 77
+      final consumer state  : amount 60.00 at version 94
+      verdict               : MISMATCH - the consumer ends up 6 update(s) behind the source of truth
 
-  Guard: Version (entity version)
-    events applied        : 34
-    stale events applied  : 0   (an update overwritten by an older one)
-    events discarded      : 66
-    final consumer state  : amount 0.00 at version 100
-    verdict               : MATCH
+    Guard: Version (entity version)
+      events applied        : 34
+      stale events applied  : 0   (an update overwritten by an older one)
+      events discarded      : 66
+      final consumer state  : amount 0.00 at version 100
+      verdict               : MATCH
 
-  Clock skew put 42 of 99 adjacent version pairs in the wrong timestamp order.
-  6 events share a millisecond with another event - no timestamp can order those at all.
+    Clock skew put 50 of 99 adjacent version pairs in the wrong timestamp order.
+    12 events share a millisecond with another event - no timestamp can order those at all.
 ```
 
-The clock reading is not merely imprecise — it leaves the consumer holding permanently wrong state.
+The clock reading is not merely imprecise. It leaves the consumer holding permanently wrong state.
 
-Broken mode skips this comparison, because there is nothing left to order: many events carry the same
-version, and the highest version in the stream is not even the one the entity ended on. The ordering
-information was destroyed at write time, not in transit. **The version is only a trustworthy ordering field
-when it is produced under the concurrency token.**
+`Unguarded` skips this comparison, because there is nothing left to order: a hundred events claim six
+versions between them, and the highest version in the stream is not even the one the entity ended on. The
+ordering information was destroyed at write time, not in transit. **A version is only a trustworthy ordering
+field when the write path that produced it guaranteed it was unique.**
 
-### "Why not just `SET Amount = Amount - 10`?"
+## The events raised
 
-For this toy balance, a relative update would indeed be atomic and conflict-free. It would not produce a
-number a consumer can order by, which is the thing we actually need. Real payloads are replaced wholesale
-(a rate, a calendar, an availability window), not incremented.
+Each scenario prints the events it actually produced, with their parameters, annotated rather than dumped.
+`Unguarded`, in eleven lines:
 
-## What we check at the end
+```
+  Events raised (100 rows, 6 notable, showing 11)
 
-In **Fixed** mode every check must pass:
+      #  Version  Amount  Published  Worker  Att  Notes
+      1        1  990.00  27:56.903     w10    1  version claimed by 17 events
+      2        1  990.00  27:56.903      w3    1  duplicate version
+      3        1  990.00  27:56.906      w5    1  duplicate version
+      4        1  990.00  27:56.927     w11    1  duplicate version
+      5        1  990.00  27:56.940      w1    1  duplicate version
+    ...                                           12 rows not shown
+     18        2  980.00  27:56.900     w93    1  version claimed by 25 events, published before previous
+    ...                                           24 rows not shown
+     43        3  970.00  27:56.971     w63    1  version claimed by 32 events, published before previous
+    ...                                           31 rows not shown
+     75        4  960.00  27:56.966     w68    1  version claimed by 18 events, published before previous
+    ...                                           17 rows not shown
+     93        5  950.00  27:56.982     w18    1  version claimed by 6 events, published before previous
+    ...                                           5 rows not shown
+     99        6  940.00  27:57.237     w32    1  version claimed by 2 events, published before previous
+    100        6  940.00  27:57.361     w64    1  duplicate version
+```
+
+A contested version is called out once, on the first event claiming it, with how many events claim it. Gaps
+are flagged. Clock inversions are noted on rows that print, but never cause a row to print — with pod skew,
+half the stream qualifies.
+
+`Att` is the attempt the write finally landed on, which is where the cost of the token shows up: in
+`Guarded` the last few events are written on attempt 35 and 39, while `AtomicIncrement` is on attempt 1
+throughout.
+
+`--Simulation:ShowEvents All` prints every row, `None` prints none.
+
+## What gets checked
+
+The same checks run against every scenario:
 
 - Final amount is `1000 - 100 * 10 = 0`
 - Final version is `100`
@@ -109,22 +188,26 @@ In **Fixed** mode every check must pass:
 - Each event's amount matches its version (`1000 - Version * 10`)
 - A consumer ordering by `Version` reproduces the source of truth under out-of-order delivery
 
-In **Broken** mode those checks are *expected* to fail, and the run reports how much damage was done. It
-exits 0 when the damage is there and 1 when the workers happened not to interleave (raise `Workers` and
-try again).
+`Guarded` and `AtomicIncrement` must pass all of them. `Unguarded` is *expected* to fail, and the run exits
+non-zero if it does not — if the workers happen not to interleave, raise `Workers` and try again.
 
-Note: there is deliberately **no unique index** on `(BalanceId, Version)`. Fixed mode has to prove the
-concurrency token alone is enough, and Broken mode has to be free to write the duplicates it produces. In
-production you would add that index — it is the only thing that catches a write path which bypasses the
-tracked entity (`ExecuteUpdate`, raw SQL, bulk backfills), where the concurrency token does not apply at all.
+One trap worth noticing in the `Unguarded` output: `Each event snapshot Amount == 1000 - Version * 10` still
+passes. Every event is individually consistent with its own duplicated version, so the corrupted stream looks
+perfectly healthy one event at a time. Only comparing events to each other reveals it.
 
-### What the approach assumes
+### What this assumes, and where it stops
 
 - The version increment and the event insert are in the **same transaction**.
-- **Every** write path goes through the tracked entity. Anything that updates the row without bumping the
+- **Every** write path goes through the protected one. Anything that updates the row without producing a
   version breaks the invariant silently.
 - Ordering holds **per entity**. Version 5 of one balance says nothing about version 5 of another, so a
   consumer must partition by entity id.
+
+There is deliberately **no unique index** on `(Scenario, BalanceId, Version)`: the guarded scenarios have to
+prove their write path alone is enough, and `Unguarded` has to be free to write the duplicates it produces so
+they can be counted. In production you would add that index — it is the only thing that catches a write path
+which bypasses the tracked entity (`ExecuteUpdate`, raw SQL, bulk backfills), where a concurrency token does
+not apply at all.
 
 ## How to run
 
@@ -134,122 +217,31 @@ You need the .NET 10 SDK and Docker running (the database starts in a throwaway 
 dotnet run
 ```
 
-Pick the database and the mode in `appsettings.json`, or override them:
-
-```
-dotnet run -- --Database:Provider SqlServer
-dotnet run -- --Database:Provider Postgres
-dotnet run -- --Simulation:Mode Broken
-```
-
-### Settings
+Settings live in `appsettings.json` and can be overridden on the command line:
 
 | `Simulation` setting | Default | What it does |
 |---|---|---|
-| `Mode` | `Fixed` | `Broken` = plain column (the problem), `Fixed` = concurrency token (the solution) |
+| `Scenarios` | `all` | Which to run and in what order, e.g. `Guarded,AtomicIncrement` |
 | `Workers` | 100 | How many workers hit the same row at once |
 | `InitialAmount` / `Decrement` | 1000 / 10 | The arithmetic each worker performs |
 | `MaxAttemptsPerWorker` | 1000 | Retry ceiling before a worker gives up |
 | `ClockSkewMs` | 250 | How far the simulated pod clocks drift apart (+/-) |
 | `DeliveryJitter` | 5 | How many positions redelivery may displace a message |
 | `Seed` | 1234 | Seeds the skew and the delivery reordering, so a run can be reproduced |
+| `ShowEvents` | `Anomalies` | Event log detail: `None`, `Anomalies` or `All` |
+| `EventContextRows` / `MaxNotableRows` | 5 / 10 | How much the `Anomalies` view prints |
 
 ## Files
 
 | File | What it does |
 |---|---|
-| `Program.cs` | Starts the DB, runs the workers, validates the result |
-| `Domain.cs` | `Balance`, `BalanceSnapshot`, `BalanceSnapshotEvent` |
-| `AppDbContext.cs` | EF Core mapping; maps `Version` as a concurrency token in Fixed mode only |
-| `ConsumerOrderingDemo.cs` | Replays the events out of order, comparing the timestamp and version guards |
-| `SimulationMode.cs` | The two modes |
+| `Program.cs` | Starts the database, runs each selected scenario, prints the summary |
+| `Scenarios.cs` | The three scenario definitions and the `--Simulation:Scenarios` parsing |
+| `ScenarioRunner.cs` | Releases the workers; holds all three write paths |
+| `Domain.cs` | The three balance types, `BalanceSnapshot`, `BalanceSnapshotEvent` |
+| `AppDbContext.cs` | EF Core mapping; the three mappings side by side |
+| `Validation.cs` | The checks, applied identically to every scenario |
+| `ConsumerOrderingDemo.cs` | Replays events out of order, comparing the timestamp and version guards |
+| `Reporting.cs` | The annotated event log and the summary table |
+| `SimulationSettings.cs` | Everything configurable |
 | `DatabaseProviders.cs` | Starts PostgreSQL or SQL Server in Docker |
-
-## Example output
-
-### Broken mode (PostgreSQL)
-
-```
-MODE    : Broken - Version is a plain column (UPDATE ... WHERE Id = @id)
-DATABASE: PostgreSQL
-
-Inserted Balance { Id = 1, Amount = 1000, Version = 0 }
-Releasing 100 workers at once...
-
-All workers finished in 0.7s
-  Total attempts    : 100
-  Max attempts      : 1 (single worker)
-  Version conflicts : 0   <- nothing rejected any writer
-
-The checks below are EXPECTED to fail in Broken mode - that failure is the point of this run.
-Final Balance: Amount = 970.00, Version = 3
-[FAIL] Balance.Amount == 0 (actual 970.00)
-[FAIL] Balance.Version == 100 (actual 3)
-[PASS] Event count == 100 (actual 100)
-[PASS] Every event Version is > 0 and < 101
-[FAIL] No duplicated versions (6 duplicated: 1, 2, 3, 4, 5, 6)
-[FAIL] Each event Version is previous + 1 (sequence 1..N) (first = 1, gaps: 1->1, 1->1, ... (+83))
-[PASS] Each event snapshot Amount == 1000 - Version * 10
-[PASS] Each event snapshot Id == 1
-
-=== Downstream consumer: which ordering field survives out-of-order delivery? ===
-Not run in Broken mode: there is nothing left to order.
-
-  99 of 100 events carry a version that another event also carries.
-  The highest version in the stream is 7, but the entity ended on version 3.
-
-  No consumer can recover the right order from that, whichever field it sorts by - the ordering
-  information was destroyed at write time, not in transit. Fix the write path first.
-
-Damage report:
-  Updates lost             : 97 of 100
-  Amount never deducted    : 970.00
-  Duplicated event versions: 6
-  Highest version reached  : 3 (should be 100)
-
-RESULT: PROBLEM REPRODUCED - updates were lost and versions duplicated.
-        Re-run with --Simulation:Mode Fixed to watch it disappear.
-```
-
-97 of the 100 deductions vanished. Note the two traps: no exception was raised anywhere, and
-`Each event snapshot Amount == 1000 - Version * 10` still passes — every event is individually consistent
-with its own version, so the corrupted stream looks perfectly healthy one event at a time.
-
-### Fixed mode (PostgreSQL)
-
-```
-MODE    : Fixed - Version is an EF concurrency token (UPDATE ... WHERE Id = @id AND Version = @oldV)
-DATABASE: PostgreSQL
-
-Inserted Balance { Id = 1, Amount = 1000, Version = 0 }
-Releasing 100 workers at once...
-
-All workers finished in 2.1s
-  Total attempts    : 1333
-  Max attempts      : 39 (single worker)
-  Version conflicts : 1233
-
-Final Balance: Amount = 0.00, Version = 100
-[PASS] Balance.Amount == 0 (actual 0.00)
-[PASS] Balance.Version == 100 (actual 100)
-[PASS] Event count == 100 (actual 100)
-[PASS] Every event Version is > 0 and < 101
-[PASS] No duplicated versions
-[PASS] Each event Version is previous + 1 (sequence 1..N)
-[PASS] Each event snapshot Amount == 1000 - Version * 10
-[PASS] Each event snapshot Id == 1
-
-=== Downstream consumer: which ordering field survives out-of-order delivery? ===
-...
-
-RESULT: SUCCESS - no lost updates, no duplicated versions, and a consumer that orders by
-        Version stays correct under out-of-order delivery.
-```
-
-### Reading the output
-
-- **1333 attempts for 100 workers**: 1233 attempts hit a version conflict and had to retry. That is the
-  concurrency protection doing its job — and the cost of it. One worker needed 39 attempts, which is worth
-  remembering before putting a hot entity behind this without backoff.
-- **0 conflicts in Broken mode** is not good news. Nothing was rejected because nothing was checked.
-- **All checks pass in Fixed mode** despite the conflicts: no update was lost and no version was duplicated.
