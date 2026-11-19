@@ -1,7 +1,6 @@
 using DotNet.Testcontainers.Containers;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Infrastructure;
 using Npgsql;
 using Testcontainers.MsSql;
 using Testcontainers.PostgreSql;
@@ -48,8 +47,6 @@ public sealed class PostgresDatabaseContainer : IDatabaseContainer
         var cs = new NpgsqlConnectionStringBuilder(_container.GetConnectionString()) { MaxPoolSize = 200 };
         return new DbContextOptionsBuilder<AppDbContext>()
             .UseNpgsql(cs.ConnectionString)
-            // Keeps the two simulation modes from sharing one cached EF model.
-            .ReplaceService<IModelCacheKeyFactory, ModeAwareModelCacheKeyFactory>()
             .Options;
     }
 
@@ -73,8 +70,6 @@ public sealed class SqlServerDatabaseContainer : IDatabaseContainer
         };
         return new DbContextOptionsBuilder<AppDbContext>()
             .UseSqlServer(cs.ConnectionString)
-            // Keeps the two simulation modes from sharing one cached EF model.
-            .ReplaceService<IModelCacheKeyFactory, ModeAwareModelCacheKeyFactory>()
             .Options;
     }
 

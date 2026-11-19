@@ -1,10 +1,10 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using EventStorePoc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 
-// Configuration: appsettings.json < environment variables (Simulation__Mode=Broken) < command line (--Simulation:Mode Broken)
+// Configuration: appsettings.json < environment variables (Simulation__Scenarios=Guarded) < command line
+// (--Simulation:Scenarios Guarded).
 var configuration = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false)
@@ -14,116 +14,112 @@ var configuration = new ConfigurationBuilder()
 
 var provider = configuration.GetValue<DatabaseProvider>("Database:Provider");
 var settings = configuration.GetSection("Simulation").Get<SimulationSettings>() ?? new SimulationSettings();
-var mode = settings.Mode;
+IReadOnlyList<ScenarioDefinition> scenarios;
 
-// Every worker stands in for a pod with its own slightly wrong clock.
+try
+{
+    scenarios = ScenarioDefinition.Parse(settings.Scenarios);
+}
+catch (ArgumentException ex)
+{
+    // A typo in the scenario list should say so in one line, not in a stack trace.
+    Console.Error.WriteLine(ex.Message);
+    return 2;
+}
+
+// Every worker stands in for a pod with its own slightly wrong clock. The same skew is handed to every
+// scenario, so they are compared under identical conditions.
 var clockSkew = BuildClockSkew(settings);
 
 await using var database = DatabaseContainerFactory.Create(provider);
 
-Console.WriteLine($"MODE    : {mode} - {ModeDescription(mode)}");
-Console.WriteLine($"DATABASE: {database.Name}");
+Console.WriteLine($"DATABASE : {database.Name}");
+Console.WriteLine($"SCENARIOS: {string.Join(", ", scenarios.Select(s => s.Name))}");
+Console.WriteLine($"WORKERS  : {settings.Workers}, released at once onto a single balance row");
 Console.WriteLine();
 
 Console.WriteLine($"Starting {database.Name} test container...");
-var sw = Stopwatch.StartNew();
+var stopwatch = Stopwatch.StartNew();
 await database.StartAsync();
-Console.WriteLine($"{database.Name} ready in {sw.Elapsed.TotalSeconds:F1}s");
+Console.WriteLine($"{database.Name} ready in {stopwatch.Elapsed.TotalSeconds:F1}s");
 
 var dbOptions = database.CreateDbContextOptions();
 
-// 1. Schema + initial Balance(Amount = 1000, Version = 0)
-await using (var db = NewContext())
+// One schema holding one table per scenario, so every scenario can run in this single launch without
+// touching the others' rows.
+await using (var db = new AppDbContext(dbOptions))
 {
     await db.Database.EnsureCreatedAsync();
-    db.Balances.Add(new Balance { Id = settings.BalanceId, Amount = settings.InitialAmount, Version = 0 });
-    await db.SaveChangesAsync();
-}
-Console.WriteLine($"Inserted Balance {{ Id = {settings.BalanceId}, Amount = {settings.InitialAmount}, Version = 0 }}");
-
-// 2. N workers released at the same moment, each one: load -> Amount -= 10, Version += 1 -> add event -> save.
-var stats = new ConcurrentDictionary<string, int>();
-var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-var workers = Enumerable.Range(1, settings.Workers)
-    .Select(workerId => Task.Run(async () =>
-    {
-        await startGate.Task;
-        return await RunWorkerAsync(workerId);
-    }))
-    .ToArray();
-
-Console.WriteLine($"Releasing {settings.Workers} workers at once...");
-sw.Restart();
-startGate.SetResult();
-var attemptsPerWorker = await Task.WhenAll(workers);
-sw.Stop();
-
-var conflicts = stats.GetValueOrDefault(nameof(DbUpdateConcurrencyException));
-
-Console.WriteLine();
-Console.WriteLine($"All workers finished in {sw.Elapsed.TotalSeconds:F1}s");
-Console.WriteLine($"  Total attempts    : {attemptsPerWorker.Sum()}");
-Console.WriteLine($"  Max attempts      : {attemptsPerWorker.Max()} (single worker)");
-Console.WriteLine($"  Version conflicts : {conflicts}{(conflicts == 0 ? "   <- nothing rejected any writer" : "")}");
-foreach (var (exceptionType, count) in stats.Where(x => x.Key != nameof(DbUpdateConcurrencyException)).OrderByDescending(x => x.Value))
-{
-    Console.WriteLine($"  Also retried on {exceptionType}: {count}x");
 }
 
-// 3. Validation
-Console.WriteLine();
-if (mode == SimulationMode.Broken)
+var outcomes = new List<ScenarioOutcome>();
+
+foreach (var scenario in scenarios)
 {
-    Console.WriteLine("The checks below are EXPECTED to fail in Broken mode - that failure is the point of this run.");
+    outcomes.Add(await RunScenarioAsync(scenario));
 }
 
-var (finalBalance, finalEvents) = await LoadFinalStateAsync();
-var report = Validate(finalBalance, finalEvents);
+return Summary.Print(outcomes, settings) ? 0 : 1;
 
-// 4. The downstream consumer: replay those events out of order and see which ordering field holds up.
-//    Only worth doing on a stream that is internally consistent, which Broken mode's is not.
-Console.WriteLine();
-
-if (mode == SimulationMode.Fixed)
+async Task<ScenarioOutcome> RunScenarioAsync(ScenarioDefinition scenario)
 {
-    var ordering = ConsumerOrderingDemo.Run(finalEvents, finalBalance.Amount, settings);
-    ConsumerOrderingDemo.Print(ordering, settings);
-
+    Console.WriteLine();
+    Console.WriteLine(new string('=', 100));
+    Console.WriteLine($"SCENARIO: {scenario.Name}");
+    Console.WriteLine($"  {scenario.Statement}");
+    Console.WriteLine(new string('=', 100));
+    Console.WriteLine($"  {scenario.Summary}");
     Console.WriteLine();
 
-    var success = report.AllPassed && ordering.VersionGuardMatches;
-    Console.WriteLine(success
-        ? "RESULT: SUCCESS - no lost updates, no duplicated versions, and a consumer that orders by"
-          + Environment.NewLine
-          + "        Version stays correct under out-of-order delivery."
-        : "RESULT: FAILURE - the concurrency token or the Version ordering did not hold.");
-    return success ? 0 : 1;
+    var run = await ScenarioRunner.RunAsync(scenario, dbOptions, settings, clockSkew);
+
+    Console.WriteLine($"  {settings.Workers} workers finished in {run.Elapsed.TotalSeconds:F1}s");
+    Console.WriteLine($"    Total attempts    : {run.TotalAttempts}");
+    Console.WriteLine($"    Max attempts      : {run.MaxAttempts} (single worker)");
+    Console.WriteLine($"    Version conflicts : {run.Conflicts}{ConflictNote(scenario, run)}");
+
+    foreach (var (error, count) in run.OtherErrors.OrderByDescending(x => x.Value))
+    {
+        Console.WriteLine($"    Also retried on {error}: {count}x");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"  Final Balance: Amount = {run.FinalAmount}, Version = {run.FinalVersion}");
+
+    var validation = Validation.Run(run, settings);
+    Console.WriteLine();
+
+    EventLog.Print(run, settings);
+
+    // The guard comparison is only worth running on a stream that is internally consistent. Decide that from
+    // the events themselves rather than from which scenario produced them.
+    var ordering = ConsumerOrderingDemo.IsOrderable(run.Events)
+        ? ConsumerOrderingDemo.Run(run.Events, run.FinalAmount, settings)
+        : null;
+
+    if (ordering is null)
+    {
+        ConsumerOrderingDemo.PrintUnorderableStream(run.Events, run.FinalVersion);
+    }
+    else
+    {
+        ConsumerOrderingDemo.Print(ordering, settings);
+    }
+
+    var metExpectation = scenario.ExpectsLostUpdates
+        ? !validation.AllPassed
+        : validation.AllPassed && ordering?.VersionGuardMatches == true;
+
+    return new ScenarioOutcome(run, validation, ordering, metExpectation);
 }
 
-ConsumerOrderingDemo.PrintUnorderableStream(finalEvents, finalBalance);
-Console.WriteLine();
-
-// Broken mode inverts the verdict: the run is only useful if the damage actually showed up.
-var lostUpdates = settings.Workers - report.FinalVersion;
-var reproduced = !report.AllPassed;
-
-Console.WriteLine("Damage report:");
-Console.WriteLine($"  Updates lost             : {lostUpdates} of {settings.Workers}");
-Console.WriteLine($"  Amount never deducted    : {report.FinalAmount - report.ExpectedFinalAmount}");
-Console.WriteLine($"  Duplicated event versions: {report.DuplicateVersionCount}");
-Console.WriteLine($"  Highest version reached  : {report.FinalVersion} (should be {settings.Workers})");
-Console.WriteLine();
-Console.WriteLine(reproduced
-    ? "RESULT: PROBLEM REPRODUCED - updates were lost and versions duplicated."
-      + Environment.NewLine
-      + "        Re-run with --Simulation:Mode Fixed to watch it disappear."
-    : "RESULT: PROBLEM NOT REPRODUCED - the workers happened not to interleave this run."
-      + Environment.NewLine
-      + "        Increase Simulation:Workers and try again.");
-return reproduced ? 0 : 1;
-
-AppDbContext NewContext() => new(dbOptions, mode);
+// Zero conflicts means something quite different in each scenario, and the difference is the whole point.
+static string ConflictNote(ScenarioDefinition scenario, ScenarioRun run) => (scenario.Kind, run.Conflicts) switch
+{
+    (ScenarioKind.Unguarded, 0) => "   <- nothing rejected any writer",
+    (ScenarioKind.AtomicIncrement, 0) => "   <- nothing to reject: there is no stale read to lose",
+    _ => "",
+};
 
 static TimeSpan[] BuildClockSkew(SimulationSettings simulation)
 {
@@ -133,155 +129,4 @@ static TimeSpan[] BuildClockSkew(SimulationSettings simulation)
     return Enumerable.Range(0, simulation.Workers)
         .Select(_ => TimeSpan.FromMilliseconds((rng.NextDouble() * 2 - 1) * simulation.ClockSkewMs))
         .ToArray();
-}
-
-static string ModeDescription(SimulationMode m) => m switch
-{
-    SimulationMode.Fixed => "Version is an EF concurrency token (UPDATE ... WHERE Id = @id AND Version = @oldV)",
-    SimulationMode.Broken => "Version is a plain column (UPDATE ... WHERE Id = @id)",
-    _ => throw new ArgumentOutOfRangeException(nameof(m), m, "Unsupported mode"),
-};
-
-async Task<int> RunWorkerAsync(int workerId)
-{
-    for (var attempt = 1; attempt <= settings.MaxAttemptsPerWorker; attempt++)
-    {
-        try
-        {
-            // Fresh DbContext per attempt -> fresh read of the current Amount/Version.
-            await using var db = NewContext();
-
-            var balance = await db.Balances.SingleAsync(b => b.Id == settings.BalanceId);
-            balance.Amount -= settings.Decrement;
-            balance.Version += 1;
-
-            db.BalanceSnapshotEvents.Add(new BalanceSnapshotEvent
-            {
-                Id = Guid.NewGuid(),
-                BalanceId = balance.Id,
-                BalanceSnapshot = new BalanceSnapshot { Id = balance.Id, Amount = balance.Amount },
-                Version = balance.Version,
-
-                // The ordering field today's code would reach for: wall-clock time, read from the clock
-                // of whichever pod handled the request and wrong by up to Simulation:ClockSkewMs.
-                PublishedAtUtc = DateTime.UtcNow + clockSkew[workerId - 1],
-            });
-
-            // Fixed mode : UPDATE Balances SET Amount = @a, Version = @newV WHERE Id = @id AND Version = @oldV;
-            // Broken mode: UPDATE Balances SET Amount = @a, Version = @newV WHERE Id = @id;
-            //              INSERT INTO BalanceSnapshotEvents ...;
-            // -> both statements in one transaction; 0 rows updated => DbUpdateConcurrencyException => rollback.
-            await db.SaveChangesAsync();
-            return attempt;
-        }
-        catch (Exception ex)
-        {
-            // DbUpdateConcurrencyException is the expected one in Fixed mode; anything else (e.g. SQL Server
-            // deadlock victim) is also retried with a brand-new DbContext as required.
-            stats.AddOrUpdate(ex.GetType().Name, 1, (_, c) => c + 1);
-        }
-    }
-
-    throw new InvalidOperationException($"Worker {workerId} gave up after {settings.MaxAttemptsPerWorker} attempts.");
-}
-
-async Task<(Balance Balance, List<BalanceSnapshotEvent> Events)> LoadFinalStateAsync()
-{
-    await using var db = NewContext();
-
-    var balance = await db.Balances.AsNoTracking().SingleAsync(b => b.Id == settings.BalanceId);
-    var events = await db.BalanceSnapshotEvents.AsNoTracking()
-        .Where(e => e.BalanceId == settings.BalanceId)
-        .OrderBy(e => e.Version)
-        .ToListAsync();
-
-    return (balance, events);
-}
-
-ValidationReport Validate(Balance balance, List<BalanceSnapshotEvent> events)
-{
-    var expectedFinalAmount = settings.InitialAmount - settings.Workers * settings.Decrement;
-    var allOk = true;
-
-    void Check(string description, bool ok, string? details = null)
-    {
-        allOk &= ok;
-        Console.WriteLine($"[{(ok ? "PASS" : "FAIL")}] {description}{(details is null ? "" : $" ({details})")}");
-    }
-
-    Console.WriteLine($"Final Balance: Amount = {balance.Amount}, Version = {balance.Version}");
-
-    Check($"Balance.Amount == {expectedFinalAmount}", balance.Amount == expectedFinalAmount, $"actual {balance.Amount}");
-    Check($"Balance.Version == {settings.Workers}", balance.Version == settings.Workers, $"actual {balance.Version}");
-    Check($"Event count == {settings.Workers}", events.Count == settings.Workers, $"actual {events.Count}");
-
-    var outOfRange = events.Where(e => e.Version <= 0 || e.Version > settings.Workers).ToList();
-    Check($"Every event Version is > 0 and < {settings.Workers + 1}", outOfRange.Count == 0,
-        outOfRange.Count == 0 ? null : $"out of range: {string.Join(", ", outOfRange.Select(e => e.Version))}");
-
-    var duplicates = events.GroupBy(e => e.Version).Where(g => g.Count() > 1).Select(g => g.Key).ToList();
-    Check("No duplicated versions", duplicates.Count == 0,
-        duplicates.Count == 0 ? null : $"{duplicates.Count} duplicated: {Preview(duplicates.Select(v => v.ToString()))}");
-
-    var gaps = events.Zip(events.Skip(1))
-        .Where(pair => pair.Second.Version != pair.First.Version + 1)
-        .Select(pair => $"{pair.First.Version}->{pair.Second.Version}")
-        .ToList();
-    var startsAtOne = events.Count == 0 || events[0].Version == 1;
-    Check("Each event Version is previous + 1 (sequence 1..N)", startsAtOne && gaps.Count == 0,
-        startsAtOne && gaps.Count == 0 ? null : $"first = {events.FirstOrDefault()?.Version}, gaps: {Preview(gaps)}");
-
-    var wrongAmounts = events
-        .Where(e => e.BalanceSnapshot.Amount != settings.InitialAmount - e.Version * settings.Decrement)
-        .Select(e => $"v{e.Version}={e.BalanceSnapshot.Amount}")
-        .ToList();
-    Check($"Each event snapshot Amount == {settings.InitialAmount} - Version * {settings.Decrement}", wrongAmounts.Count == 0,
-        wrongAmounts.Count == 0 ? null : $"{wrongAmounts.Count} wrong: {Preview(wrongAmounts)}");
-
-    var wrongSnapshotIds = events.Count(e => e.BalanceSnapshot.Id != settings.BalanceId);
-    Check($"Each event snapshot Id == {settings.BalanceId}", wrongSnapshotIds == 0, wrongSnapshotIds == 0 ? null : $"{wrongSnapshotIds} wrong");
-
-    return new ValidationReport(
-        AllPassed: allOk,
-        FinalAmount: balance.Amount,
-        ExpectedFinalAmount: expectedFinalAmount,
-        FinalVersion: balance.Version,
-        EventCount: events.Count,
-        DuplicateVersionCount: duplicates.Count);
-}
-
-static string Preview(IEnumerable<string> values, int take = 10)
-{
-    var list = values.ToList();
-    var head = string.Join(", ", list.Take(take));
-    return list.Count > take ? $"{head}, ... (+{list.Count - take})" : head;
-}
-
-public sealed record ValidationReport(
-    bool AllPassed,
-    decimal FinalAmount,
-    decimal ExpectedFinalAmount,
-    int FinalVersion,
-    int EventCount,
-    int DuplicateVersionCount);
-
-public sealed class SimulationSettings
-{
-    /// <summary>Broken = no concurrency token (shows the problem), Fixed = concurrency token (shows the solution).</summary>
-    public SimulationMode Mode { get; init; } = SimulationMode.Fixed;
-
-    public int BalanceId { get; init; } = 1;
-    public decimal InitialAmount { get; init; } = 1000m;
-    public decimal Decrement { get; init; } = 10m;
-    public int Workers { get; init; } = 100;
-    public int MaxAttemptsPerWorker { get; init; } = 1000;
-
-    /// <summary>How far the simulated pod clocks drift apart, in milliseconds (+/- this value).</summary>
-    public int ClockSkewMs { get; init; } = 250;
-
-    /// <summary>How many positions redelivery may displace a message from its publish order.</summary>
-    public int DeliveryJitter { get; init; } = 5;
-
-    /// <summary>Seed for the clock skew and for the delivery reordering, so a run can be reproduced.</summary>
-    public int Seed { get; init; } = 1234;
 }
