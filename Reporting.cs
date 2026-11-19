@@ -22,24 +22,79 @@ public static class EventLog
             return;
         }
 
-        var rows = Annotate(run.Events);
+        var publishesVersion = run.Scenario.ConsumerOrdersBy == OrderingField.Version;
+
+        // A scenario that publishes no version is printed the way its consumers actually receive it: sorted
+        // by the one field they were given, and without the column they were not. The disorder then shows up
+        // on its own in the Amount column, because an account that is only ever drawn down cannot go up.
+        var events = publishesVersion
+            ? run.Events
+            : run.Events.OrderBy(e => e.PublishedAtUtc).ThenBy(e => e.Version).ToList();
+
+        var rows = publishesVersion ? AnnotateByVersion(events) : AnnotateByClock(events);
         var shown = Select(rows, settings);
         var notable = rows.Count(r => r.Notable);
 
-        Console.WriteLine($"  Events raised ({rows.Count} rows, {notable} notable, showing {shown.Count})");
+        Console.WriteLine(publishesVersion
+            ? $"  Events raised ({rows.Count} rows, {notable} notable, showing {shown.Count})"
+            // Deliberately not called an inversion count: this counts the places the visible sequence goes
+            // backwards, which is a different statistic from the version-adjacent inversions the checks
+            // report, and giving them the same name would invite someone to reconcile two numbers that
+            // measure different things.
+            : $"  Events raised, in the only order these consumers can impose - by PublishedAtUtc"
+              + $" ({rows.Count} rows, balance rises {notable} times, showing {shown.Count})");
         Console.WriteLine();
 
-        var table = new List<string[]> { new[] { "#", "Version", "Amount", "Published", "Worker", "Att", "Notes" } };
+        var table = new List<string[]>
+        {
+            publishesVersion
+                ? new[] { "#", "Version", "Amount", "Published", "Worker", "Att", "Notes" }
+                : new[] { "#", "Amount", "Published", "Worker", "Att", "Notes" },
+        };
         var previousNumber = 0;
 
         foreach (var row in shown)
         {
             if (row.Number > previousNumber + 1)
             {
-                table.Add(["...", "", "", "", "", "", $"{row.Number - previousNumber - 1} rows not shown"]);
+                table.Add(Elision($"{row.Number - previousNumber - 1} rows not shown"));
             }
 
-            table.Add([
+            table.Add(Cells(row));
+            previousNumber = row.Number;
+        }
+
+        if (previousNumber < rows.Count)
+        {
+            table.Add(Elision($"{rows.Count - previousNumber} rows not shown"));
+        }
+
+        Table.Write(
+            table,
+            publishesVersion
+                ? [true, true, true, true, true, true, false]
+                : [true, true, true, true, true, false],
+            indent: "    ");
+        Console.WriteLine();
+
+        if (!publishesVersion)
+        {
+            Console.WriteLine($"    Nothing above is wrong on its own - every row is a real event, with the real balance at the");
+            Console.WriteLine($"    moment it was written. Read the Amount column downwards and it rises {notable} time{(notable == 1 ? "" : "s")}, which a");
+            Console.WriteLine($"    balance that is only ever drawn down cannot do. The stream is out of order, and no field in");
+            Console.WriteLine($"    it says which row belongs where.");
+            Console.WriteLine();
+        }
+
+        if (settings.ShowEvents != ShowEvents.All && shown.Count < rows.Count)
+        {
+            Console.WriteLine("    (pass --Simulation:ShowEvents All for every row)");
+            Console.WriteLine();
+        }
+
+        string[] Cells(Row row) => publishesVersion
+            ? new[]
+            {
                 row.Number.ToString(),
                 row.Event.Version.ToString(),
                 row.Event.BalanceSnapshot.Amount.ToString("F2"),
@@ -47,27 +102,50 @@ public static class EventLog
                 $"w{row.Event.WorkerId}",
                 row.Event.Attempt.ToString(),
                 row.Notes,
-            ]);
+            }
+            : new[]
+            {
+                row.Number.ToString(),
+                row.Event.BalanceSnapshot.Amount.ToString("F2"),
+                row.Event.PublishedAtUtc.ToString("mm:ss.fff"),
+                $"w{row.Event.WorkerId}",
+                row.Event.Attempt.ToString(),
+                row.Notes,
+            };
 
-            previousNumber = row.Number;
-        }
-
-        if (previousNumber < rows.Count)
-        {
-            table.Add(["...", "", "", "", "", "", $"{rows.Count - previousNumber} rows not shown"]);
-        }
-
-        Table.Write(table, [true, true, true, true, true, true, false], indent: "    ");
-        Console.WriteLine();
-
-        if (settings.ShowEvents != ShowEvents.All && shown.Count < rows.Count)
-        {
-            Console.WriteLine("    (pass --Simulation:ShowEvents All for every row)");
-            Console.WriteLine();
-        }
+        string[] Elision(string text) => publishesVersion
+            ? new[] { "...", "", "", "", "", "", text }
+            : new[] { "...", "", "", "", "", text };
     }
 
-    private static List<Row> Annotate(IReadOnlyList<BalanceSnapshotEvent> events)
+    /// <summary>
+    /// Annotates the stream as a consumer holding only a timestamp sees it. Sorted by that timestamp, the
+    /// Amount column ought to fall steadily - every worker takes money out and none puts any back. Each
+    /// place it rises instead is a pair of events the clock ordered wrongly, said in terms of what the
+    /// consumer can actually see rather than in terms of the version it was never given.
+    /// </summary>
+    private static List<Row> AnnotateByClock(IReadOnlyList<BalanceSnapshotEvent> events)
+    {
+        var rows = new List<Row>(events.Count);
+
+        for (var i = 0; i < events.Count; i++)
+        {
+            var current = events[i];
+            var previous = i > 0 ? events[i - 1] : null;
+            var rose = previous is not null
+                && current.BalanceSnapshot.Amount > previous.BalanceSnapshot.Amount;
+
+            rows.Add(new Row(
+                i + 1,
+                current,
+                rose ? $"balance went UP by {current.BalanceSnapshot.Amount - previous!.BalanceSnapshot.Amount:F2}" : "",
+                rose));
+        }
+
+        return rows;
+    }
+
+    private static List<Row> AnnotateByVersion(IReadOnlyList<BalanceSnapshotEvent> events)
     {
         // Events arrive ordered by version, so every set of events claiming one version is contiguous.
         var claimsPerVersion = events.GroupBy(e => e.Version).ToDictionary(g => g.Key, g => g.Count());

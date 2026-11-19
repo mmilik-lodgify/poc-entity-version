@@ -45,11 +45,11 @@ the commit at all. `TimestampOnly` exists to prove that rather than assert it.
 
 ```
   Scenario         Orders by  Attempts  Conflicts  Lost  Final amount  Final ver  Clock inv  Replay by clock  Replay by version
-  TimestampOnly    clock            47         37     0          0.00         10        4/9  4 behind         exact
-  Guarded          version          45         35     0          0.00         10        4/9  exact (luck)     exact
-  AtomicIncrement  version          10          0     0          0.00         10        4/9  3 behind         exact
+  TimestampOnly    clock            48         38     0          0.00         10        5/9  3 behind         exact
+  Guarded          version          47         37     0          0.00         10        4/9  1 behind         exact
+  AtomicIncrement  version          10          0     0          0.00         10        4/9  4 behind         exact
 
-  Cost of being correct: Guarded needed 45 attempts to land 10 writes, AtomicIncrement needed 10.
+  Cost of being correct: Guarded needed 47 attempts to land 10 writes, AtomicIncrement needed 10.
 ```
 
 Ten workers each take 10 out of a balance holding exactly `10 * 10`, so a correct run ends on 0. Read across
@@ -57,15 +57,16 @@ one row at a time:
 
 - **`Lost` is 0 in every row, and every balance ends on 0.00 at version 10.** That column is the premise of
   the whole comparison: no scenario here loses a write, so nothing below is about lost updates.
-- **`Clock inv`** is the finding. In every scenario, 4 of the 9 adjacent pairs in commit order have a
+- **`Clock inv`** is the finding. In every scenario, 4 or 5 of the 9 adjacent pairs in commit order have a
   *non-increasing* timestamp — the clock disagrees with the order the database committed in. That is a
   property of the field, so it shows up in all three rows; what differs is who depends on it.
 - **`Replay by clock` vs `Replay by version`**: the same stream, delivered in the same scrambled order, into
   the same projection twice. The version lands on the source of truth every time. The clock does not.
-- **`exact (luck)`** on the `Guarded` row is not a pass. That guard finished on the right value although the
-  stream still arrived out of order, because the newest event happened to carry the latest reading too. On
-  the next run it is several updates behind. **This is why the verdict is taken from `Clock inv` and not
-  from the replay** — one replay landing right proves nothing, while a single inversion disproves the field.
+- **`exact (luck)`**, which turns up on one row or another from run to run, is not a pass. It means that
+  guard finished on the right value although the stream still arrived out of order, because the newest event
+  happened to carry the latest reading too. On the next run the same code is several updates behind. **This
+  is why the verdict is taken from `Clock inv` and not from the replay** — one replay landing right proves
+  nothing, while a single inversion disproves the field.
 
 ## The three scenarios
 
@@ -95,21 +96,22 @@ The run then proves the timestamp cannot do the job:
 
 ```
   Ordering field - whether PublishedAtUtc could order this stream at all:
-    [FAIL] PublishedAtUtc increases with commit order (4 of 9 adjacent pairs inverted: v3->v4, v6->v7, v8->v9, v9->v10)
+    [FAIL] PublishedAtUtc increases with commit order (5 of 9 adjacent pairs inverted: v1->v2, v3->v4, v4->v5, v7->v8, v9->v10)
     [PASS] No two events share a millisecond (0 of 10 events do)
 ```
 
-Events are read back in version order, which *is* commit order, so walking them and watching the timestamps
-is a direct test. Four inversions means four places where a consumer ordering by the clock would reject an
-update that was in fact newer. The consequence, replayed:
+The run reads its events back in version order, which *is* commit order, so walking them and watching the
+timestamps is a direct test — and note that this is the harness checking, with ground truth a consumer does
+not have. Five inversions means five places where a consumer ordering by the clock would reject an update
+that was in fact newer. The consequence, replayed:
 
 ```
     Guard: PublishedAtUtc (pod clock)   <- the field this scenario's consumers use
-      events applied        : 4
+      events applied        : 3
       stale events applied  : 0   (an update overwritten by an older one)
-      events discarded      : 6
-      final consumer state  : amount 40.00 at version 6
-      verdict               : MISMATCH - the consumer ends up 4 update(s) behind the source of truth
+      events discarded      : 7
+      final consumer state  : amount 30.00 at version 7
+      verdict               : MISMATCH - the consumer ends up 3 update(s) behind the source of truth
 
     Guard: Version (entity version)
       events applied        : 4
@@ -119,7 +121,7 @@ update that was in fact newer. The consequence, replayed:
       verdict               : MATCH
 ```
 
-The balance in the database is correct and the consumer is four updates behind it, permanently. The second
+The balance in the database is correct and the consumer is three updates behind it, permanently. The second
 guard is the same stream ordered by the field this scenario refuses to publish — it is there to show that the
 information existed and was thrown away.
 
@@ -180,89 +182,108 @@ visible or neither is.
 Each scenario prints every event it produced, with its parameters. At the default ten workers all three lists
 print whole, so they can be compared row by row.
 
-`TimestampOnly`. `Version` is shown here as the ground truth the run uses to judge the timestamp — it is not
-in the published event:
+`TimestampOnly` is printed the way its consumers receive it — sorted by the only field it publishes, and
+without the version column it never gave them:
+
+```
+     #  Amount  Published  Worker  Att  Notes
+     1   80.00  35:10.139     w10    2
+     2   50.00  35:10.178      w3    4
+     3   60.00  35:10.214      w5    3  balance went UP by 10.00
+     4   40.00  35:10.341      w1    5
+     5   20.00  35:10.592      w8    7
+     6    0.00  35:10.847      w9    9
+     7   10.00  35:11.170      w7    8  balance went UP by 10.00
+     8   90.00  35:11.216      w2    1  balance went UP by 80.00
+     9   70.00  35:11.424      w4    3
+    10   30.00  35:11.443      w6    6
+```
+
+Nothing in that table is a false record. Every row is a real event carrying the real balance at the moment it
+was written, and every one of them is individually consistent. It is the *order* that is wrong — and the
+order is all a consumer has.
+
+So read the `Amount` column downwards. The account is drawn down to **0.00 at row 6**, and then has money in
+it again, twice more, finishing at **30.00**. A balance that is only ever drawn down cannot rise, so each
+rise is a pair of events the clock placed the wrong way round. A consumer replaying this stream in the order
+it can see ends up believing the account holds 30 when it holds nothing — which is exactly what the replay
+below reports.
+
+That is the argument for publishing a monotonic version, made without needing to mention versions at all.
+
+`Guarded` — the same write, the same retries, the version now published, so the stream can be printed in
+commit order:
 
 ```
      #  Version  Amount  Published  Worker  Att  Notes
-     1        1   90.00  07:12.630     w10    1
-     2        2   80.00  07:12.886      w1    2
-     3        3   70.00  07:13.985      w4    2
-     4        4   60.00  07:12.747      w3    3  published before previous
-     5        5   50.00  07:13.154      w8    4
-     6        6   40.00  07:14.013      w6    5
-     7        7   30.00  07:12.799      w5    6  published before previous
-     8        8   20.00  07:13.916      w2    7
-     9        9   10.00  07:13.745      w7    8  published before previous
-    10       10    0.00  07:13.421      w9    9  published before previous
-```
-
-Read the `Published` column downwards. It goes 12.630, 12.886, 13.985, 12.747, 13.154, 14.013 — the fourth
-event was committed after the third and carries a reading more than a second earlier. A consumer sorting by
-that column does not get this stream back in this order, and no amount of care downstream can recover it.
-
-`Guarded` — same write, same retries, the version now published:
-
-```
-     #  Version  Amount  Published  Worker  Att  Notes
-     1        1   90.00  07:12.916      w5    1
-     2        2   80.00  07:12.870     w10    2  published before previous
-     3        3   70.00  07:13.864      w7    2
-     4        4   60.00  07:13.541      w9    3  published before previous
-     5        5   50.00  07:14.156      w6    4
-     6        6   40.00  07:13.302      w8    5  published before previous
-     7        7   30.00  07:12.903      w3    5  published before previous
-     8        8   20.00  07:13.067      w1    7
-     9        9   10.00  07:14.069      w2    7
-    10       10    0.00  07:14.176      w4    9
+     1        1   90.00  35:10.463      w1    1
+     2        2   80.00  35:10.714      w8    2
+     3        3   70.00  35:11.575      w6    3
+     4        4   60.00  35:10.319      w3    3  published before previous
+     5        5   50.00  35:10.310     w10    4  published before previous
+     6        6   40.00  35:11.303      w7    5
+     7        7   30.00  35:10.983      w9    6  published before previous
+     8        8   20.00  35:11.492      w2    7
+     9        9   10.00  35:11.598      w4    7
+    10       10    0.00  35:10.388      w5    9  published before previous
 ```
 
 `AtomicIncrement` — the same gapless sequence, every write on its first attempt:
 
 ```
      #  Version  Amount  Published  Worker  Att  Notes
-     1        1   90.00  07:12.996      w5    1
-     2        2   80.00  07:14.224      w6    1
-     3        3   70.00  07:12.968      w3    1  published before previous
-     4        4   60.00  07:12.958     w10    1  published before previous
-     5        5   50.00  07:13.378      w8    1
-     6        6   40.00  07:13.955      w7    1
-     7        7   30.00  07:14.236      w4    1
-     8        8   20.00  07:14.137      w2    1  published before previous
-     9        9   10.00  07:13.146      w1    1  published before previous
-    10       10    0.00  07:13.639      w9    1
+     1        1   90.00  35:10.383      w3    1
+     2        2   80.00  35:11.650      w6    1
+     3        3   70.00  35:10.554      w1    1  published before previous
+     4        4   60.00  35:10.801      w8    1
+     5        5   50.00  35:10.441      w5    1  published before previous
+     6        6   40.00  35:11.659      w4    1
+     7        7   30.00  35:11.560      w2    1  published before previous
+     8        8   20.00  35:10.397     w10    1  published before previous
+     9        9   10.00  35:11.063      w9    1
+    10       10    0.00  35:11.394      w7    1
 ```
 
-Two columns carry most of the argument:
+`Amount` falls cleanly from 90 to 0 in both, because `Version` could be used to sort them. `TimestampOnly`
+would look exactly like this if it published the version its write path already produced — that is the only
+difference between the first table and these two.
 
-- `Version` is `1..10` and gapless in all three, because all three write safely. Only the first scenario
-  declines to publish it.
+Two columns carry the rest of the argument:
+
+- `Version` is `1..10` and gapless in both, because both write safely — and `TimestampOnly` is too, since it
+  writes identically. Not publishing it is enough on its own to make the stream unorderable downstream.
 - `Att` is the attempt the write finally landed on, which is where the cost of each strategy shows up: the
   token climbs to attempt 9 for ten writes, `AtomicIncrement` stays on attempt 1 throughout.
 
-`published before previous` marks a row whose timestamp is earlier than the previous version's. It appears in
-every scenario, because the clock is skewed in every scenario — that is the point. It is noted on rows that
-print but never causes a row to print, since with pod skew about half the stream qualifies.
+`Worker` and `Att` are harness metadata rather than published fields. They are in the table so the retrying
+can be seen, not because a consumer would receive them.
+
+In the version-ordered tables, `published before previous` marks a row whose timestamp is earlier than the
+previous version's. It appears in every scenario, because the clock is skewed in every scenario — that is the
+point. It is noted on rows that print but never causes a row to print, since with pod skew about half the
+stream qualifies.
 
 Raise the worker count and the full list stops being readable, so `--Simulation:ShowEvents Anomalies` keeps a
-few leading rows plus anything worth looking at and elides the rest. At 100 workers:
+few leading rows plus anything worth looking at and elides the rest. `TimestampOnly` at 100 workers:
 
 ```
-  Events raised (100 rows, 0 notable, showing 7)
+  Events raised, in the only order these consumers can impose - by PublishedAtUtc (100 rows, balance rises 48 times, showing 17)
 
-      #  Version  Amount  Published  Worker  Att  Notes
-      1        1  990.00  08:24.094     w12    1
-      2        2  980.00  08:23.106      w3    1  published before previous
-      3        3  970.00  08:23.222     w99    2
-      4        4  960.00  08:23.160     w96    1  published before previous
-      5        5  950.00  08:23.210      w5    2
-    ...                                           93 rows not shown
-     99       99   10.00  08:24.574     w26   34  published before previous
-    100      100    0.00  08:25.239     w23   33
+      #  Amount  Published  Worker  Att  Notes
+      1  990.00  35:38.856     w84    1
+      2  980.00  35:39.101     w24    1
+      3  870.00  35:39.334     w82    1
+      4  810.00  35:39.393     w93    2
+      5  710.00  35:39.547     w87    4
+    ...                                  1 rows not shown
 ```
 
-`0 notable` is itself a result: nothing in those 100 events duplicated a version or skipped one. A duplicate
-or a gap would be called out here, which makes this view the thing to watch if a write path ever regresses.
+The balance rises 48 times in 100 events. The gaps show how far the stream has been shuffled even where it
+is falling: 980 straight to 870 means the ten events in between sort somewhere else entirely.
+
+Run the same view on `Guarded` or `AtomicIncrement` and it reports `0 notable`, which is itself a result —
+nothing in those 100 events duplicated a version or skipped one. A duplicate or a gap would be called out
+there, which makes that view the thing to watch if a write path ever regresses.
 
 ## What gets checked
 
