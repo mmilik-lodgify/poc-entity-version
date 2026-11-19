@@ -1,6 +1,7 @@
 using DotNet.Testcontainers.Containers;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 using Testcontainers.MsSql;
 using Testcontainers.PostgreSql;
@@ -34,8 +35,11 @@ public static class DatabaseContainerFactory
 public sealed class PostgresDatabaseContainer : IDatabaseContainer
 {
     private readonly PostgreSqlContainer _container = new PostgreSqlBuilder("postgres:17-alpine")
-        // Default max_connections (100) is too tight for 100 concurrent workers + pool overhead.
+        // Default max_connections (100) is too tight once Simulation:Workers is raised into the hundreds.
         .WithCommand("-c", "max_connections=300")
+        // The Docker lifecycle chatter is noise in output meant to be read in a review or pasted into
+        // a document. The run prints its own progress line instead.
+        .WithLogger(NullLogger.Instance)
         .Build();
 
     public string Name => "PostgreSQL";
@@ -45,7 +49,9 @@ public sealed class PostgresDatabaseContainer : IDatabaseContainer
     public DbContextOptions<AppDbContext> CreateDbContextOptions()
     {
         var cs = new NpgsqlConnectionStringBuilder(_container.GetConnectionString()) { MaxPoolSize = 200 };
-        return new DbContextOptionsBuilder<AppDbContext>().UseNpgsql(cs.ConnectionString).Options;
+        return new DbContextOptionsBuilder<AppDbContext>()
+            .UseNpgsql(cs.ConnectionString)
+            .Options;
     }
 
     public ValueTask DisposeAsync() => _container.DisposeAsync();
@@ -53,7 +59,9 @@ public sealed class PostgresDatabaseContainer : IDatabaseContainer
 
 public sealed class SqlServerDatabaseContainer : IDatabaseContainer
 {
-    private readonly MsSqlContainer _container = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest").Build();
+    private readonly MsSqlContainer _container = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest")
+        .WithLogger(NullLogger.Instance)
+        .Build();
 
     public string Name => "SQL Server";
 
@@ -66,7 +74,9 @@ public sealed class SqlServerDatabaseContainer : IDatabaseContainer
             MaxPoolSize = 200,
             InitialCatalog = "EventStorePoc",
         };
-        return new DbContextOptionsBuilder<AppDbContext>().UseSqlServer(cs.ConnectionString).Options;
+        return new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlServer(cs.ConnectionString)
+            .Options;
     }
 
     public ValueTask DisposeAsync() => _container.DisposeAsync();
