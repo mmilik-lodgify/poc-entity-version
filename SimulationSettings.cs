@@ -22,8 +22,14 @@ public sealed class SimulationSettings
     public string Scenarios { get; init; } = "all";
 
     public int BalanceId { get; init; } = 1;
-    public decimal InitialAmount { get; init; } = 1000m;
     public decimal Decrement { get; init; } = 10m;
+
+    /// <summary>
+    /// The starting balance, derived so that every worker can take its share and a correct run ends on
+    /// exactly zero whatever <see cref="Workers"/> is. Money left in the account is then a lost write,
+    /// visible without doing any arithmetic.
+    /// </summary>
+    public decimal InitialAmount => Workers * Decrement;
     public int Workers { get; init; } = 10;
     public int MaxAttemptsPerWorker { get; init; } = 1000;
 
